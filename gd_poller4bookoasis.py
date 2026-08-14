@@ -12,9 +12,8 @@ gd_poller4bookoasis 플러그인
 cache_cleaner 플러그인과 동일한 패턴을 사용한다:
 자체 스레드로 time.sleep 루프를 도는 대신, 코어가 이미 쓰고 있는
 `services.scheduler_service.scheduler` (APScheduler BackgroundScheduler)
-싱글톤에 잡을 등록해서 실행한다. CRON_SCHEDULE을 주면 진짜 crontab
-표현식을 쓸 수 있고, 비워두면 POLL_INTERVAL_SECONDS 기반의 단순 반복
-(IntervalTrigger)으로 동작한다.
+싱글톤에 잡을 등록해서 실행한다. POLL_INTERVAL_SECONDS 주기의 단순
+반복(IntervalTrigger)으로 동작한다.
 
 주의: 코어의 `SchedulerService.reload_all_jobs()`는 호출될 때마다 등록된
 잡을 전부 지우고 라이브러리 스캔 잡만 재등록한다. 그래서 이 플러그인의
@@ -49,11 +48,16 @@ WATCH_TARGET_5에 하나씩 나눠 적는다 (최대 5개, 안 쓰는 건 비워
 구글 드라이브 폴더 하위 트리 전체를 매번 다시 훑으면 비효율적이므로,
 타겟별로 최초 1회만 전체 인덱싱(folder_ids, item_ids)하고 이후에는
 Drive Changes API의 page_token만 이어서 사용한다. 이 상태는 타겟별
-상태 파일(state_<라벨>.json)에 저장해 프로세스/서버 재시작에도 이어진다.
+상태 파일(state_<remote_name>_<폴더ID>.json)에 저장해 프로세스/서버
+재시작에도 이어진다. 상태 파일 키를 라벨이 아니라 remote_name+폴더ID
+조합으로 잡는 이유는, 서로 다른 REMOTE_NAME을 쓰는 두 타겟이 같은
+라벨을 쓰는 경우에도 상태가 안 섞이게 하기 위함이다.
 
 ## 상태 확인
 1) 설정 화면(settings.html 또는 config_schema 자동 폼 옆 상태 영역): get_status() 참고
-2) 로그 파일: <STATE_DIR>/gd_poller4bookoasis.log (타겟별 라벨이 각 줄에 표시됨)
+2) 로그 파일: <STATE_DIR>/gd_poller4bookoasis.log
+   각 줄에 "라벨:REMOTE_NAME:폴더ID(앞부분)" 형태로 표시되어, REMOTE_NAME이
+   여러 개일 때도 어느 타겟인지 바로 구분 가능하다.
 
 수동으로 즉시 1회 확인하고 싶다면 handle_action(db_type, "check_now")를 호출하면 된다.
 """
@@ -96,14 +100,10 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
          "required": True, "default": "http://localhost:5572"},
         {"key": "RC_USER", "label": "rclone RC 사용자 (선택)", "type": "text", "required": False, "default": ""},
         {"key": "RC_PASS", "label": "rclone RC 비밀번호 (선택)", "type": "password", "required": False, "default": ""},
-        {"key": "RC_FS", "label": "rclone fs 지정 (여러 mount일 때만, 선택)", "type": "text",
-         "required": False, "default": ""},
         {"key": "DISCORD_WEBHOOK_URL", "label": "디스코드 웹훅 URL (선택, 비우면 알림 없음)",
          "type": "password", "required": False, "default": ""},
-        {"key": "POLL_INTERVAL_SECONDS", "label": "폴링 주기 (초) - CRON_SCHEDULE이 비어있을 때만 사용",
+        {"key": "POLL_INTERVAL_SECONDS", "label": "폴링 주기 (초)",
          "type": "text", "required": False, "default": "15"},
-        {"key": "CRON_SCHEDULE", "label": "Cron 표현식 (비우면 위 주기(초) 기반 반복 사용)",
-         "type": "text", "required": False, "default": ""},
         {"key": "HEARTBEAT_EVERY_N_RUNS", "label": "하트비트 알림 주기 (N번 폴링마다 1번, 0=끔)",
          "type": "text", "required": False, "default": "0"},
     ]
@@ -157,11 +157,6 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
 
     def _build_trigger(self, db_type):
         cfg = self.get_plugin_config(db_type, default={})
-        cron_expr = (cfg.get("CRON_SCHEDULE") or "").strip()
-        if cron_expr:
-            from apscheduler.triggers.cron import CronTrigger
-            return CronTrigger.from_crontab(cron_expr)
-
         from apscheduler.triggers.interval import IntervalTrigger
         try:
             interval_sec = int(cfg.get("POLL_INTERVAL_SECONDS") or 15)
@@ -176,11 +171,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
             self._register_fallback_thread(db_type)
             return False
 
-        try:
-            trigger = self._build_trigger(db_type)
-        except ValueError as e:
-            self._log_line(f"[전체] 잘못된 CRON_SCHEDULE: {e}")
-            return False
+        trigger = self._build_trigger(db_type)
 
         try:
             scheduler.add_job(
@@ -291,22 +282,37 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         return targets
 
     # ------------------------------------------------------------------
-    # 상태/로그 파일 경로 (플러그인 폴더 내부, 타겟 라벨 기준)
+    # 상태/로그 파일 경로 (플러그인 폴더 내부)
+    #
+    # 상태 파일 키는 라벨이 아니라 "remote_name:folder_id" 조합으로 잡는다.
+    # 라벨만으로 키를 잡으면, 서로 다른 REMOTE_NAME을 쓰는 두 타겟이 같은
+    # 라벨을 쓸 때 상태 파일을 공유해버려서 인덱스/page_token이 서로
+    # 덮어써지는 버그가 있었다 (실사용 중 발견됨). remote_name+folder_id는
+    # 실제로 감시하는 대상 자체를 가리키므로 중복될 일이 없다.
     # ------------------------------------------------------------------
     def _plugin_dir(self):
         return os.path.dirname(os.path.abspath(__file__))
 
-    def _safe_label(self, label):
-        return "".join(c if c.isalnum() or c in "-_" else "_" for c in label)
+    def _safe_key(self, text):
+        return "".join(c if c.isalnum() or c in "-_" else "_" for c in text)
 
-    def _state_path(self, label):
-        return os.path.join(self._plugin_dir(), f"state_{self._safe_label(label)}.json")
+    def _state_key(self, target):
+        return self._safe_key(f"{target.get('remote_name')}_{target.get('folder_id')}")
+
+    def _display_label(self, target):
+        """로그/디스코드 알림에 쓰는 표시용 라벨: 라벨:REMOTE_NAME:폴더ID(앞 10자)"""
+        folder_id = target.get("folder_id") or ""
+        short_folder = folder_id[:10] + "......." if len(folder_id) > 10 else folder_id
+        return f"{target.get('label')}:{target.get('remote_name')}:{short_folder}"
+
+    def _state_path(self, state_key):
+        return os.path.join(self._plugin_dir(), f"state_{state_key}.json")
 
     def _log_path(self):
         return os.path.join(self._plugin_dir(), "gd_poller4bookoasis.log")
 
-    def _read_state(self, label):
-        path = self._state_path(label)
+    def _read_state(self, state_key):
+        path = self._state_path(state_key)
         if not os.path.isfile(path):
             return None
         try:
@@ -315,9 +321,9 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         except (OSError, json.JSONDecodeError):
             return None
 
-    def _write_state(self, label, state):
+    def _write_state(self, state_key, state):
         try:
-            with open(self._state_path(label), "w", encoding="utf-8") as f:
+            with open(self._state_path(state_key), "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False)
         except OSError:
             pass
@@ -330,16 +336,16 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         except OSError:
             pass
 
-    def _log(self, label, result):
+    def _log(self, state_key, display_label, result):
         self._log_line(
-            f"[{label}] mode={result.get('mode', 'ok')} "
+            f"[{display_label}] mode={result.get('mode', 'ok')} "
             f"changes={result.get('changes_found', 0)} "
             f"error={result.get('error', '-')}"
         )
-        state = self._read_state(label) or {}
+        state = self._read_state(state_key) or {}
         state["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         state["last_result"] = result
-        self._write_state(label, state)
+        self._write_state(state_key, state)
 
     # ------------------------------------------------------------------
     # rclone RC API(config/dump)로 OAuth 토큰 읽기
@@ -416,18 +422,15 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         rc_addr = cfg.get("RC_ADDR") or "http://localhost:5572"
         rc_user = cfg.get("RC_USER") or ""
         rc_pass = cfg.get("RC_PASS") or ""
-        rc_fs = cfg.get("RC_FS") or None
 
         params = {"recursive": "true"}
-        if rc_fs:
-            params["fs"] = rc_fs
         auth = (rc_user, rc_pass) if rc_user else None
 
         resp = requests.post(f"{rc_addr}/vfs/refresh", params=params, auth=auth, timeout=30)
         resp.raise_for_status()
         return resp.json()
 
-    def _notify_discord(self, db_type, label, change_lines):
+    def _notify_discord(self, db_type, display_label, change_lines):
         import requests
         cfg = self.get_plugin_config(db_type, default={})
         webhook_url = cfg.get("DISCORD_WEBHOOK_URL") or ""
@@ -437,7 +440,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         if len(body) > 1900:
             shown = change_lines[:20]
             body = "\n".join(shown) + f"\n...외 {len(change_lines) - len(shown)}건"
-        message = f"📁 [{label}] 구글 드라이브 변경 감지\n{body}"
+        message = f"📁 [{display_label}] 구글 드라이브 변경 감지\n{body}"
         try:
             resp = requests.post(webhook_url, json={"content": message}, timeout=15)
             resp.raise_for_status()
@@ -461,10 +464,9 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         cfg = self.get_plugin_config(db_type, default={})
         targets = self._parse_watch_targets(cfg)
         interval = cfg.get("POLL_INTERVAL_SECONDS") or "15"
-        cron = (cfg.get("CRON_SCHEDULE") or "").strip()
-        schedule_desc = f"cron: {cron}" if cron else f"{interval}초 주기"
+        schedule_desc = f"{interval}초 주기"
         target_desc = "\n".join(
-            (f"- {t['label']}: {t.get('remote_name')}:{t.get('folder_id')}"
+            (f"- {self._display_label(t)}"
              if not t.get("parse_error") else f"- {t['label']}: ⚠️ {t['parse_error']}")
             for t in targets
         ) or "(설정된 감시 대상 없음)"
@@ -479,17 +481,18 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
     def check_target(self, db_type, target):
         from googleapiclient.discovery import build
 
-        label = target["label"]
         if target.get("parse_error"):
             return {"mode": "error", "error": target["parse_error"], "changes_found": 0}
 
         remote_name = target["remote_name"]
         folder_id = target["folder_id"]
+        state_key = self._state_key(target)
+        display_label = self._display_label(target)
 
         creds = self._load_credentials(db_type, remote_name)
         drive = build("drive", "v3", credentials=creds)
 
-        state = self._read_state(label) or {}
+        state = self._read_state(state_key) or {}
 
         # 최초 실행 시에만 하위 트리 전체 인덱싱
         if "folder_ids" not in state or state.get("indexed_folder_id") != folder_id:
@@ -501,7 +504,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
                 "item_ids": list(item_ids),
                 "page_token": page_token,
             }
-            self._write_state(label, state)
+            self._write_state(state_key, state)
             return {"mode": "indexed", "changes_found": 0,
                     "note": f"초기 인덱싱 완료: 폴더 {len(folder_ids)}개, 항목 {len(item_ids)}개"}
 
@@ -548,11 +551,11 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         state["page_token"] = page_token
         run_count = int(state.get("run_count", 0)) + 1
         state["run_count"] = run_count
-        self._write_state(label, state)
+        self._write_state(state_key, state)
 
         if change_lines:
             self._call_rclone_rc_refresh(db_type)
-            self._notify_discord(db_type, label, change_lines)
+            self._notify_discord(db_type, display_label, change_lines)
         else:
             cfg = self.get_plugin_config(db_type, default={})
             try:
@@ -560,7 +563,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
             except (TypeError, ValueError):
                 heartbeat_n = 0
             if heartbeat_n > 0 and run_count % heartbeat_n == 0:
-                self._notify_simple(db_type, f"💓 [{label}] 정상 동작 중 (누적 {run_count}회 폴링, 변경 없음)")
+                self._notify_simple(db_type, f"💓 [{display_label}] 정상 동작 중 (누적 {run_count}회 폴링, 변경 없음)")
 
         return {"mode": "ok", "changes_found": len(change_lines), "changes": change_lines[:20]}
 
@@ -594,13 +597,14 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         for i, target in enumerate(targets):
             if i > 0:
                 time.sleep(stagger_sec)
-            label = target["label"]
+            display_label = self._display_label(target) if not target.get("parse_error") else target["label"]
+            state_key = self._state_key(target) if not target.get("parse_error") else self._safe_key(target["label"])
             try:
                 result = self.check_target(db_type, target)
             except Exception as e:
                 result = {"mode": "error", "error": str(e), "changes_found": 0}
-            self._log(label, result)
-            results.append({"label": label, **result})
+            self._log(state_key, display_label, result)
+            results.append({"label": display_label, **result})
         return results
 
     # ------------------------------------------------------------------
@@ -620,11 +624,12 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
 
         per_target = []
         for target in targets:
-            label = target["label"]
-            state = self._read_state(label) or {}
+            state_key = self._state_key(target) if not target.get("parse_error") else self._safe_key(target["label"])
+            display_label = self._display_label(target) if not target.get("parse_error") else target["label"]
+            state = self._read_state(state_key) or {}
             last_result = state.get("last_result") or {}
             per_target.append({
-                "label": label,
+                "label": display_label,
                 "remote_name": target.get("remote_name"),
                 "folder_id": target.get("folder_id"),
                 "parse_error": target.get("parse_error"),
