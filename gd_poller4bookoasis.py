@@ -566,6 +566,13 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
 
     # ------------------------------------------------------------------
     # WATCH_TARGET_1~5 전체 순회 (APScheduler 잡 / 워치독 폴백 / 수동 실행 공용)
+    #
+    # 여러 타겟을 한 번에 몰아서 호출하면 구글 드라이브 API의 분당 요청
+    # 한도(rateLimitExceeded)에 걸리기 쉽다. 그래서 타겟들을 동시에
+    # 처리하지 않고, "폴링 주기 ÷ 타겟 수" 만큼 시차를 두고 하나씩
+    # 순차 호출한다. 예를 들어 주기가 15초고 타겟이 3개면 약 5초
+    # 간격으로 하나씩 처리 - 다음 폴링 틱이 오기 전에 전체 순회가
+    # 끝나면서도, 순간적으로 API가 몰리는 상황 자체를 피할 수 있다.
     # ------------------------------------------------------------------
     def check_all_targets(self, db_type):
         cfg = self.get_plugin_config(db_type, default={})
@@ -575,8 +582,18 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
             self._log_line("[전체] WATCH_TARGET_1~5가 모두 비어있습니다")
             return []
 
+        try:
+            interval_sec = int(cfg.get("POLL_INTERVAL_SECONDS") or 15)
+        except (TypeError, ValueError):
+            interval_sec = 15
+        # cron 스케줄을 쓰는 경우 등 interval을 알 수 없을 때의 기본 시차.
+        # 전체 순회가 다음 폴링 틱 전에 여유 있게 끝나도록 80%만 사용.
+        stagger_sec = max(0.5, (interval_sec * 0.8) / max(1, len(targets)))
+
         results = []
-        for target in targets:
+        for i, target in enumerate(targets):
+            if i > 0:
+                time.sleep(stagger_sec)
             label = target["label"]
             try:
                 result = self.check_target(db_type, target)
