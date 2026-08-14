@@ -82,6 +82,8 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
          "type": "text", "required": False, "default": "15"},
         {"key": "CRON_SCHEDULE", "label": "Cron 표현식 (비우면 위 주기(초) 기반 반복 사용)",
          "type": "text", "required": False, "default": ""},
+        {"key": "HEARTBEAT_EVERY_N_RUNS", "label": "하트비트 알림 주기 (N번 폴링마다 1번, 0=끔)",
+         "type": "text", "required": False, "default": "0"},
     ]
 
     update_manifest = {
@@ -116,6 +118,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
     def on_enable(self, db_type):
         self._register_job(db_type)
         self._ensure_watchdog(db_type)
+        self._notify_startup(db_type)
 
     def on_disable(self, db_type):
         try:
@@ -376,6 +379,30 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         except requests.RequestException:
             pass  # 알림 실패는 refresh 자체를 막지 않음
 
+    def _notify_simple(self, db_type, message):
+        """변경 목록 없이 단문 메시지만 보낼 때 (시작 알림/하트비트용)"""
+        import requests
+        cfg = self.get_plugin_config(db_type, default={})
+        webhook_url = cfg.get("DISCORD_WEBHOOK_URL") or ""
+        if not webhook_url:
+            return
+        try:
+            resp = requests.post(webhook_url, json={"content": message}, timeout=15)
+            resp.raise_for_status()
+        except requests.RequestException:
+            pass
+
+    def _notify_startup(self, db_type):
+        cfg = self.get_plugin_config(db_type, default={})
+        folder_id = cfg.get("DRIVE_FOLDER_ID") or "(미설정)"
+        interval = cfg.get("POLL_INTERVAL_SECONDS") or "15"
+        cron = (cfg.get("CRON_SCHEDULE") or "").strip()
+        schedule_desc = f"cron: {cron}" if cron else f"{interval}초 주기"
+        self._notify_simple(
+            db_type,
+            f"🟢 gd_poller4bookoasis 감시 시작\n폴더 ID: {folder_id}\n주기: {schedule_desc}",
+        )
+
     # ------------------------------------------------------------------
     # 핵심 로직 — 1회 점검 (APScheduler 잡 / 워치독 폴백 / 수동 실행 공용)
     # ------------------------------------------------------------------
@@ -447,11 +474,20 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         state["folder_ids"] = list(folder_ids)
         state["item_ids"] = list(item_ids)
         state["page_token"] = page_token
+        run_count = int(state.get("run_count", 0)) + 1
+        state["run_count"] = run_count
         self._write_state(db_type, state)
 
         if change_lines:
             self._call_rclone_rc_refresh(db_type)
             self._notify_discord(db_type, change_lines)
+        else:
+            try:
+                heartbeat_n = int(cfg.get("HEARTBEAT_EVERY_N_RUNS") or 0)
+            except (TypeError, ValueError):
+                heartbeat_n = 0
+            if heartbeat_n > 0 and run_count % heartbeat_n == 0:
+                self._notify_simple(db_type, f"💓 gd_poller4bookoasis 정상 동작 중 (누적 {run_count}회 폴링, 변경 없음)")
 
         return {"mode": "ok", "changes_found": len(change_lines), "changes": change_lines[:20]}
 
@@ -487,6 +523,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
             "last_run": last_run,
             "last_mode": last_result.get("mode", "-"),
             "last_changes_found": last_result.get("changes_found", 0),
+            "run_count": state.get("run_count", 0),
             "next_run": next_run or "확인 불가 (폴백 스레드 모드)",
             "scheduler_backend": scheduler_backend,
             "indexed": bool(state.get("folder_ids")),
@@ -507,3 +544,29 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
             self._log(db_type, result)
             return {"success": True, "result": result}
         return {"success": False, "error": f"알 수 없는 action: {action}"}
+
+
+# ------------------------------------------------------------------
+# 모듈 import 시점에 자체 등록 (on_enable 훅에 의존하지 않음)
+#
+# 코어가 플러그인 활성화 시 on_enable을 실제로 호출해주는지 문서/코드로
+# 확실히 보장되지 않는다 (cache_cleaner 원작자도 동일한 우려를 남겼다).
+# 반면 "이 파일이 정상적으로 import된다"는 것은 코어의 플러그인 로드
+# 성공 여부(환경설정 > 플러그인 설정 화면의 로드 실패 목록)로 바로 확인
+# 가능한 확실한 지점이다. 그래서 on_enable을 기다리지 않고, 모듈이
+# import되는 즉시 알려진 DB 스코프 전부에 대해 스케줄러 잡 등록을
+# 시도한다. 플러그인이 실제로 비활성 상태여도 DRIVE_FOLDER_ID 등 필수
+# 설정이 비어있으면 check_once()가 에러 결과만 반환하고 조용히 끝나므로
+# 부작용은 없다.
+# ------------------------------------------------------------------
+def _auto_register_all_scopes():
+    for _db_type in ("general", "adult", "audiobook"):
+        try:
+            _provider = GdPoller4BookOasisProvider()
+            _provider._register_job(_db_type)
+            _provider._ensure_watchdog(_db_type)
+        except Exception:
+            pass
+
+
+_auto_register_all_scopes()
