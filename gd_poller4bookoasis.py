@@ -28,14 +28,20 @@ cache_cleaner 플러그인과 동일한 패턴을 사용한다:
 ## db이름:REMOTE_NAME:구글폴더ID 다중 매핑 (WATCH_TARGETS)
 플러그인 설정 화면이 general/adult/audiobook을 구분해서 값을 따로 넣을
 수 있는 구조가 아니라(설정은 사실상 전역 하나), "db - remote - 폴더ID"
-쌍을 여러 개 감시하고 싶으면 WATCH_TARGETS 설정 하나에 한 줄씩 적는다.
+쌍을 여러 개 감시하고 싶으면 WATCH_TARGETS 설정 하나에 세미콜론(;)으로
+구분해서 적는다.
 
-    형식: <라벨>:<REMOTE_NAME>:<구글드라이브 폴더 ID>
+    형식: <라벨>:<REMOTE_NAME>:<구글드라이브 폴더 ID>;<라벨>:<REMOTE_NAME>:<폴더ID>;...
     예)
-    general:gds2:1AbCdEfGhIjKlMnOpQrSt
-    adult:gds2:1XyZ9876543210AbCdEfGh
+    general:gds2:1AbCdEfGhIjKlMnOpQrSt;adult:gds2:1XyZ9876543210AbCdEfGh
 
-각 줄이 독립적으로 인덱싱/폴링/refresh/알림 처리된다. 라벨은 로그와
+세미콜론을 구분자로 쓰는 이유: config_schema가 실제 UI에서 한 줄짜리
+입력창으로 렌더링되는 경우, 사용자가 입력한 줄바꿈이 저장 과정에서
+공백으로 뭉개지는 문제가 실제로 있었다. 줄바꿈(엔터로 여러 줄 입력이
+가능한 환경이면 그것도 여전히 지원됨)에 의존하지 않는 세미콜론 구분이
+더 안전하다.
+
+각 항목이 독립적으로 인덱싱/폴링/refresh/알림 처리된다. 라벨은 로그와
 디스코드 메시지 구분용일 뿐, 실제 BookOasis 라이브러리 스코프와는
 무관하다 (rclone VFS refresh 자체가 라이브러리 스코프와 무관한 공용
 동작이기 때문).
@@ -77,8 +83,8 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
     is_searchable = False
 
     config_schema = [
-        {"key": "WATCH_TARGETS", "label": "감시 대상 목록 (한 줄에 하나: 라벨:REMOTE_NAME:구글폴더ID)",
-         "type": "textarea", "required": True, "default": "general:gdrive:"},
+        {"key": "WATCH_TARGETS", "label": "감시 대상 (라벨:REMOTE_NAME:구글폴더ID, 여러 개는 세미콜론 ; 으로 구분)",
+         "type": "text", "required": True, "default": "general:gdrive:"},
         {"key": "RC_ADDR", "label": "rclone RC 주소", "type": "text",
          "required": True, "default": "http://localhost:5572"},
         {"key": "RC_USER", "label": "rclone RC 사용자 (선택)", "type": "text", "required": False, "default": ""},
@@ -234,32 +240,39 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
             time.sleep(max(5, interval_sec))
 
     # ------------------------------------------------------------------
-    # WATCH_TARGETS 파싱 ("라벨:REMOTE_NAME:폴더ID" 한 줄씩)
+    # WATCH_TARGETS 파싱 ("라벨:REMOTE_NAME:폴더ID" 항목을 세미콜론(;)
+    # 또는 줄바꿈으로 구분). 세미콜론을 기본 구분자로 안내하는 이유:
+    # config_schema의 textarea 타입이 실제 UI에서 진짜 여러 줄 입력으로
+    # 렌더링된다는 보장이 없고, 한 줄짜리 입력창으로 렌더링되면 사용자가
+    # 입력한 줄바꿈이 저장 과정에서 공백으로 뭉개질 수 있기 때문이다
+    # (실제로 이 문제가 발생해서 세미콜론 구분으로 바꿨다). 줄바꿈이
+    # 살아있는 환경도 여전히 지원하도록 둘 다 구분자로 받는다.
     # ------------------------------------------------------------------
     @staticmethod
     def _parse_watch_targets(cfg):
+        import re
         raw = cfg.get("WATCH_TARGETS") or ""
+        entries = [e.strip() for e in re.split(r"[;\n]+", raw)]
         targets = []
-        for line_no, line in enumerate(raw.splitlines(), start=1):
-            line = line.strip()
-            if not line or line.startswith("#"):
+        for idx, entry in enumerate(entries, start=1):
+            if not entry or entry.startswith("#"):
                 continue
-            parts = line.split(":", 2)
+            parts = entry.split(":", 2)
             if len(parts) != 3:
                 targets.append({
-                    "label": f"줄{line_no}",
+                    "label": f"항목{idx}",
                     "remote_name": None,
                     "folder_id": None,
-                    "parse_error": f"형식 오류 (라벨:REMOTE_NAME:폴더ID 여야 함): '{line}'",
+                    "parse_error": f"형식 오류 (라벨:REMOTE_NAME:폴더ID 여야 함): '{entry}'",
                 })
                 continue
             label, remote_name, folder_id = (p.strip() for p in parts)
             if not label or not remote_name or not folder_id:
                 targets.append({
-                    "label": label or f"줄{line_no}",
+                    "label": label or f"항목{idx}",
                     "remote_name": remote_name or None,
                     "folder_id": folder_id or None,
-                    "parse_error": f"빈 값 있음: '{line}'",
+                    "parse_error": f"빈 값 있음: '{entry}'",
                 })
                 continue
             targets.append({
