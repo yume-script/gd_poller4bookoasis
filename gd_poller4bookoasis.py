@@ -25,23 +25,22 @@ cache_cleaner 플러그인과 동일한 패턴을 사용한다:
 `services.scheduler_service`를 못 불러오는 환경(플러그인 샌드박스 등)이면
 예전처럼 자체 스레드 루프로 폴백한다.
 
-## db이름:REMOTE_NAME:구글폴더ID 다중 매핑 (WATCH_TARGETS)
+## db이름:REMOTE_NAME:구글폴더ID 다중 매핑 (WATCH_TARGET_1 ~ WATCH_TARGET_5)
 플러그인 설정 화면이 general/adult/audiobook을 구분해서 값을 따로 넣을
 수 있는 구조가 아니라(설정은 사실상 전역 하나), "db - remote - 폴더ID"
-쌍을 여러 개 감시하고 싶으면 WATCH_TARGETS 설정 하나에 세미콜론(;)으로
-구분해서 적는다.
+쌍을 여러 개 감시하고 싶으면 독립된 입력 필드 WATCH_TARGET_1 ~
+WATCH_TARGET_5에 하나씩 나눠 적는다 (최대 5개, 안 쓰는 건 비워두면 됨).
 
-    형식: <라벨>:<REMOTE_NAME>:<구글드라이브 폴더 ID>;<라벨>:<REMOTE_NAME>:<폴더ID>;...
+    형식 (각 필드마다): <라벨>:<REMOTE_NAME>:<구글드라이브 폴더 ID>
     예)
-    general:gds2:1AbCdEfGhIjKlMnOpQrSt;adult:gds2:1XyZ9876543210AbCdEfGh
+    WATCH_TARGET_1 = general:gds2:1AbCdEfGhIjKlMnOpQrSt
+    WATCH_TARGET_2 = adult:gds2:1XyZ9876543210AbCdEfGh
 
-세미콜론을 구분자로 쓰는 이유: config_schema가 실제 UI에서 한 줄짜리
-입력창으로 렌더링되는 경우, 사용자가 입력한 줄바꿈이 저장 과정에서
-공백으로 뭉개지는 문제가 실제로 있었다. 줄바꿈(엔터로 여러 줄 입력이
-가능한 환경이면 그것도 여전히 지원됨)에 의존하지 않는 세미콜론 구분이
-더 안전하다.
+한 줄짜리 입력창에 세미콜론/줄바꿈으로 여러 항목을 구분하는 방식도
+시도했었는데, 저장 과정에서 구분자가 깨지는 문제가 실제로 있었다.
+필드를 아예 물리적으로 나누면 그 문제 자체가 생기지 않는다.
 
-각 항목이 독립적으로 인덱싱/폴링/refresh/알림 처리된다. 라벨은 로그와
+각 필드가 독립적으로 인덱싱/폴링/refresh/알림 처리된다. 라벨은 로그와
 디스코드 메시지 구분용일 뿐, 실제 BookOasis 라이브러리 스코프와는
 무관하다 (rclone VFS refresh 자체가 라이브러리 스코프와 무관한 공용
 동작이기 때문).
@@ -83,8 +82,16 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
     is_searchable = False
 
     config_schema = [
-        {"key": "WATCH_TARGETS", "label": "감시 대상 (라벨:REMOTE_NAME:구글폴더ID, 여러 개는 세미콜론 ; 으로 구분)",
-         "type": "text", "required": True, "default": "general:gdrive:"},
+        {"key": "WATCH_TARGET_1", "label": "감시 대상 1 (라벨:REMOTE_NAME:구글폴더ID)", "type": "text",
+         "required": True, "default": ""},
+        {"key": "WATCH_TARGET_2", "label": "감시 대상 2 (선택, 비우면 사용 안 함)", "type": "text",
+         "required": False, "default": ""},
+        {"key": "WATCH_TARGET_3", "label": "감시 대상 3 (선택, 비우면 사용 안 함)", "type": "text",
+         "required": False, "default": ""},
+        {"key": "WATCH_TARGET_4", "label": "감시 대상 4 (선택, 비우면 사용 안 함)", "type": "text",
+         "required": False, "default": ""},
+        {"key": "WATCH_TARGET_5", "label": "감시 대상 5 (선택, 비우면 사용 안 함)", "type": "text",
+         "required": False, "default": ""},
         {"key": "RC_ADDR", "label": "rclone RC 주소", "type": "text",
          "required": True, "default": "http://localhost:5572"},
         {"key": "RC_USER", "label": "rclone RC 사용자 (선택)", "type": "text", "required": False, "default": ""},
@@ -240,27 +247,27 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
             time.sleep(max(5, interval_sec))
 
     # ------------------------------------------------------------------
-    # WATCH_TARGETS 파싱 ("라벨:REMOTE_NAME:폴더ID" 항목을 세미콜론(;)
-    # 또는 줄바꿈으로 구분). 세미콜론을 기본 구분자로 안내하는 이유:
-    # config_schema의 textarea 타입이 실제 UI에서 진짜 여러 줄 입력으로
-    # 렌더링된다는 보장이 없고, 한 줄짜리 입력창으로 렌더링되면 사용자가
-    # 입력한 줄바꿈이 저장 과정에서 공백으로 뭉개질 수 있기 때문이다
-    # (실제로 이 문제가 발생해서 세미콜론 구분으로 바꿨다). 줄바꿈이
-    # 살아있는 환경도 여전히 지원하도록 둘 다 구분자로 받는다.
+    # WATCH_TARGET_1 ~ WATCH_TARGET_5 파싱 ("라벨:REMOTE_NAME:폴더ID")
+    #
+    # 원래는 세미콜론/줄바꿈으로 구분한 하나의 문자열 설정(WATCH_TARGETS)
+    # 이었는데, 설정 화면이 한 줄짜리 입력창이라 여러 줄/구분자 입력이
+    # 실수하기 쉽고 저장 과정에서 깨지는 문제가 있었다. 그래서 아예
+    # 독립된 입력 필드 5개(WATCH_TARGET_1..5)로 나눴다 - 각 필드는 항목
+    # 하나만 담당하므로 구분자 문제 자체가 생기지 않는다. 5개보다 많이
+    # 필요하면 config_schema에 WATCH_TARGET_6, 7... 을 같은 패턴으로
+    # 추가하고 아래 range()도 늘리면 된다.
     # ------------------------------------------------------------------
     @staticmethod
     def _parse_watch_targets(cfg):
-        import re
-        raw = cfg.get("WATCH_TARGETS") or ""
-        entries = [e.strip() for e in re.split(r"[;\n]+", raw)]
         targets = []
-        for idx, entry in enumerate(entries, start=1):
-            if not entry or entry.startswith("#"):
+        for i in range(1, 6):
+            entry = (cfg.get(f"WATCH_TARGET_{i}") or "").strip()
+            if not entry:
                 continue
             parts = entry.split(":", 2)
             if len(parts) != 3:
                 targets.append({
-                    "label": f"항목{idx}",
+                    "label": f"WATCH_TARGET_{i}",
                     "remote_name": None,
                     "folder_id": None,
                     "parse_error": f"형식 오류 (라벨:REMOTE_NAME:폴더ID 여야 함): '{entry}'",
@@ -269,7 +276,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
             label, remote_name, folder_id = (p.strip() for p in parts)
             if not label or not remote_name or not folder_id:
                 targets.append({
-                    "label": label or f"항목{idx}",
+                    "label": label or f"WATCH_TARGET_{i}",
                     "remote_name": remote_name or None,
                     "folder_id": folder_id or None,
                     "parse_error": f"빈 값 있음: '{entry}'",
@@ -359,7 +366,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         if remote_name not in all_remotes:
             raise RuntimeError(
                 f"rclone RC({rc_addr})의 config/dump 응답에 remote '{remote_name}'가 없습니다. "
-                f"WATCH_TARGETS의 REMOTE_NAME과 rclone에 등록된 이름이 일치하는지 확인하세요."
+                f"WATCH_TARGET_N의 REMOTE_NAME과 rclone에 등록된 이름이 일치하는지 확인하세요."
             )
 
         section = all_remotes[remote_name]
@@ -558,14 +565,14 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         return {"mode": "ok", "changes_found": len(change_lines), "changes": change_lines[:20]}
 
     # ------------------------------------------------------------------
-    # WATCH_TARGETS 전체 순회 (APScheduler 잡 / 워치독 폴백 / 수동 실행 공용)
+    # WATCH_TARGET_1~5 전체 순회 (APScheduler 잡 / 워치독 폴백 / 수동 실행 공용)
     # ------------------------------------------------------------------
     def check_all_targets(self, db_type):
         cfg = self.get_plugin_config(db_type, default={})
         targets = self._parse_watch_targets(cfg)
 
         if not targets:
-            self._log_line("[전체] WATCH_TARGETS가 비어있습니다")
+            self._log_line("[전체] WATCH_TARGET_1~5가 모두 비어있습니다")
             return []
 
         results = []
@@ -657,7 +664,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
 #
 # 설정 저장소 자체가 "general" 스코프 하나뿐이라(실제 UI가 그렇게
 # 되어 있음) 그 스코프로만 잡을 등록한다. general/adult/audiobook
-# 여러 db를 감시하고 싶으면 스코프를 늘리는 게 아니라, WATCH_TARGETS
+# 여러 db를 감시하고 싶으면 스코프를 늘리는 게 아니라, WATCH_TARGET_1~5
 # 설정 안에 "라벨:REMOTE_NAME:폴더ID" 줄을 여러 개 적으면 된다.
 # ------------------------------------------------------------------
 def _auto_register():
