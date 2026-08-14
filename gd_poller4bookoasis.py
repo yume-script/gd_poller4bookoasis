@@ -668,5 +668,18 @@ def _auto_register():
     except Exception:
         pass
 
+    # 예전 버전(general/adult/audiobook 3중 자동 등록)에서 만들어진
+    # 유령 잡 정리. 스케줄러가 영속 저장소를 쓰는 경우 재시작해도 이
+    # 잡들이 안 지워지고 계속 실행되면서 낡은 에러를 반복 출력하는
+    # 문제가 있어 명시적으로 제거한다.
+    try:
+        from services.scheduler_service import scheduler
+        for _stale_db_type in ("adult", "audiobook"):
+            _stale_job_id = GdPoller4BookOasisProvider._job_id(_stale_db_type)
+            if scheduler.get_job(_stale_job_id):
+                scheduler.remove_job(_stale_job_id)
+    except Exception:
+        pass
+
 
 _auto_register()
