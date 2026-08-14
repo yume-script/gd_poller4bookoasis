@@ -100,6 +100,8 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
          "required": True, "default": "http://localhost:5572"},
         {"key": "RC_USER", "label": "rclone RC 사용자 (선택)", "type": "text", "required": False, "default": ""},
         {"key": "RC_PASS", "label": "rclone RC 비밀번호 (선택)", "type": "password", "required": False, "default": ""},
+        {"key": "RC_FS", "label": "refresh 대상 fs (union 등 마운트에 실제 쓴 이름, 여러 mount일 때 필수)",
+         "type": "text", "required": False, "default": ""},
         {"key": "DISCORD_WEBHOOK_URL", "label": "디스코드 웹훅 URL (선택, 비우면 알림 없음)",
          "type": "password", "required": False, "default": ""},
         {"key": "POLL_INTERVAL_SECONDS", "label": "폴링 주기 (초)",
@@ -380,6 +382,18 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         client_secret = section.get("client_secret") or None
         token_raw = section.get("token")
         if not token_raw:
+            if (section.get("type") or "").lower() == "union":
+                upstreams_raw = section.get("upstreams") or ""
+                # "gdrive1:books gdrive2:books" 형태에서 remote 이름만 추출
+                upstream_names = [u.split(":", 1)[0] for u in upstreams_raw.split() if u]
+                hint = (
+                    f" 이 remote를 구성하는 하위 remote: {', '.join(upstream_names)} 중 하나를 "
+                    f"REMOTE_NAME으로 지정하세요."
+                    if upstream_names else ""
+                )
+                raise RuntimeError(
+                    f"remote '{remote_name}'는 union 타입이라 자체 OAuth 토큰이 없습니다.{hint}"
+                )
             raise RuntimeError(f"remote '{remote_name}'에 token 정보가 없습니다 (rclone에서 인증이 안 된 상태일 수 있음)")
 
         token_data = json.loads(token_raw) if isinstance(token_raw, str) else token_raw
@@ -422,8 +436,11 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         rc_addr = cfg.get("RC_ADDR") or "http://localhost:5572"
         rc_user = cfg.get("RC_USER") or ""
         rc_pass = cfg.get("RC_PASS") or ""
+        rc_fs = cfg.get("RC_FS") or None
 
         params = {"recursive": "true"}
+        if rc_fs:
+            params["fs"] = rc_fs
         auth = (rc_user, rc_pass) if rc_user else None
 
         resp = requests.post(f"{rc_addr}/vfs/refresh", params=params, auth=auth, timeout=30)
