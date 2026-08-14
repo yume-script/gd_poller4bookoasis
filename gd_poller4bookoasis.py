@@ -25,15 +25,30 @@ cache_cleaner 플러그인과 동일한 패턴을 사용한다:
 `services.scheduler_service`를 못 불러오는 환경(플러그인 샌드박스 등)이면
 예전처럼 자체 스레드 루프로 폴백한다.
 
+## db이름:REMOTE_NAME:구글폴더ID 다중 매핑 (WATCH_TARGETS)
+플러그인 설정 화면이 general/adult/audiobook을 구분해서 값을 따로 넣을
+수 있는 구조가 아니라(설정은 사실상 전역 하나), "db - remote - 폴더ID"
+쌍을 여러 개 감시하고 싶으면 WATCH_TARGETS 설정 하나에 한 줄씩 적는다.
+
+    형식: <라벨>:<REMOTE_NAME>:<구글드라이브 폴더 ID>
+    예)
+    general:gds2:1AbCdEfGhIjKlMnOpQrSt
+    adult:gds2:1XyZ9876543210AbCdEfGh
+
+각 줄이 독립적으로 인덱싱/폴링/refresh/알림 처리된다. 라벨은 로그와
+디스코드 메시지 구분용일 뿐, 실제 BookOasis 라이브러리 스코프와는
+무관하다 (rclone VFS refresh 자체가 라이브러리 스코프와 무관한 공용
+동작이기 때문).
+
 ## 첫 인덱싱 / Changes API page_token 영속화
 구글 드라이브 폴더 하위 트리 전체를 매번 다시 훑으면 비효율적이므로,
-최초 1회만 전체 인덱싱(folder_ids, item_ids)하고 이후에는 Drive
-Changes API의 page_token만 이어서 사용한다. 이 상태는 플러그인 상태
-파일(state.json)에 저장해 프로세스/서버 재시작에도 이어진다.
+타겟별로 최초 1회만 전체 인덱싱(folder_ids, item_ids)하고 이후에는
+Drive Changes API의 page_token만 이어서 사용한다. 이 상태는 타겟별
+상태 파일(state_<라벨>.json)에 저장해 프로세스/서버 재시작에도 이어진다.
 
 ## 상태 확인
 1) 설정 화면(settings.html 또는 config_schema 자동 폼 옆 상태 영역): get_status() 참고
-2) 로그 파일: <STATE_DIR>/gd_poller4bookoasis.log
+2) 로그 파일: <STATE_DIR>/gd_poller4bookoasis.log (타겟별 라벨이 각 줄에 표시됨)
 
 수동으로 즉시 1회 확인하고 싶다면 handle_action(db_type, "check_now")를 호출하면 된다.
 """
@@ -53,11 +68,7 @@ def run_gd_poller4bookoasis_job(db_type):
     인스턴스 상태에 의존하지 않도록 매번 새 provider를 만들어 쓴다.
     """
     provider = GdPoller4BookOasisProvider()
-    try:
-        result = provider.check_once(db_type)
-        provider._log(db_type, result)
-    except Exception as e:
-        provider._log(db_type, {"mode": "error", "error": str(e), "changes_found": 0})
+    provider.check_all_targets(db_type)
 
 
 class GdPoller4BookOasisProvider(BaseMetadataProvider):
@@ -66,10 +77,8 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
     is_searchable = False
 
     config_schema = [
-        {"key": "REMOTE_NAME", "label": "rclone remote 이름", "type": "text",
-         "required": True, "default": "gdrive"},
-        {"key": "DRIVE_FOLDER_ID", "label": "감시할 구글 드라이브 폴더 ID", "type": "text",
-         "required": True, "default": ""},
+        {"key": "WATCH_TARGETS", "label": "감시 대상 목록 (한 줄에 하나: 라벨:REMOTE_NAME:구글폴더ID)",
+         "type": "textarea", "required": True, "default": "general:gdrive:"},
         {"key": "RC_ADDR", "label": "rclone RC 주소", "type": "text",
          "required": True, "default": "http://localhost:5572"},
         {"key": "RC_USER", "label": "rclone RC 사용자 (선택)", "type": "text", "required": False, "default": ""},
@@ -157,7 +166,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         try:
             trigger = self._build_trigger(db_type)
         except ValueError as e:
-            self._log(db_type, {"mode": "error", "error": f"잘못된 CRON_SCHEDULE: {e}", "changes_found": 0})
+            self._log_line(f"[전체] 잘못된 CRON_SCHEDULE: {e}")
             return False
 
         try:
@@ -171,7 +180,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
             )
             return True
         except Exception as e:
-            self._log(db_type, {"mode": "error", "error": f"스케줄러 등록 실패: {e}", "changes_found": 0})
+            self._log_line(f"[전체] 스케줄러 등록 실패: {e}")
             return False
 
     def _ensure_watchdog(self, db_type):
@@ -221,27 +230,63 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
                 interval_sec = int(cfg.get("POLL_INTERVAL_SECONDS") or 15)
             except (TypeError, ValueError):
                 interval_sec = 15
-            try:
-                result = self.check_once(db_type)
-                self._log(db_type, result)
-            except Exception as e:
-                self._log(db_type, {"mode": "error", "error": str(e), "changes_found": 0})
+            self.check_all_targets(db_type)
             time.sleep(max(5, interval_sec))
 
     # ------------------------------------------------------------------
-    # 상태/로그 파일 경로 (플러그인 폴더 내부)
+    # WATCH_TARGETS 파싱 ("라벨:REMOTE_NAME:폴더ID" 한 줄씩)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_watch_targets(cfg):
+        raw = cfg.get("WATCH_TARGETS") or ""
+        targets = []
+        for line_no, line in enumerate(raw.splitlines(), start=1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(":", 2)
+            if len(parts) != 3:
+                targets.append({
+                    "label": f"줄{line_no}",
+                    "remote_name": None,
+                    "folder_id": None,
+                    "parse_error": f"형식 오류 (라벨:REMOTE_NAME:폴더ID 여야 함): '{line}'",
+                })
+                continue
+            label, remote_name, folder_id = (p.strip() for p in parts)
+            if not label or not remote_name or not folder_id:
+                targets.append({
+                    "label": label or f"줄{line_no}",
+                    "remote_name": remote_name or None,
+                    "folder_id": folder_id or None,
+                    "parse_error": f"빈 값 있음: '{line}'",
+                })
+                continue
+            targets.append({
+                "label": label,
+                "remote_name": remote_name,
+                "folder_id": folder_id,
+                "parse_error": None,
+            })
+        return targets
+
+    # ------------------------------------------------------------------
+    # 상태/로그 파일 경로 (플러그인 폴더 내부, 타겟 라벨 기준)
     # ------------------------------------------------------------------
     def _plugin_dir(self):
         return os.path.dirname(os.path.abspath(__file__))
 
-    def _state_path(self, db_type):
-        return os.path.join(self._plugin_dir(), f"state_{db_type}.json")
+    def _safe_label(self, label):
+        return "".join(c if c.isalnum() or c in "-_" else "_" for c in label)
+
+    def _state_path(self, label):
+        return os.path.join(self._plugin_dir(), f"state_{self._safe_label(label)}.json")
 
     def _log_path(self):
         return os.path.join(self._plugin_dir(), "gd_poller4bookoasis.log")
 
-    def _read_state(self, db_type):
-        path = self._state_path(db_type)
+    def _read_state(self, label):
+        path = self._state_path(label)
         if not os.path.isfile(path):
             return None
         try:
@@ -250,30 +295,31 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         except (OSError, json.JSONDecodeError):
             return None
 
-    def _write_state(self, db_type, state):
+    def _write_state(self, label, state):
         try:
-            with open(self._state_path(db_type), "w", encoding="utf-8") as f:
+            with open(self._state_path(label), "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False)
         except OSError:
             pass
 
-    def _log(self, db_type, result):
+    def _log_line(self, text):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
-            line = (
-                f"[{ts}] mode={result.get('mode', 'ok')} "
-                f"changes={result.get('changes_found', 0)} "
-                f"error={result.get('error', '-')}"
-            )
             with open(self._log_path(), "a", encoding="utf-8") as f:
-                f.write(line + "\n")
+                f.write(f"[{ts}] {text}\n")
         except OSError:
             pass
 
-        state = self._read_state(db_type) or {}
-        state["last_run"] = ts
+    def _log(self, label, result):
+        self._log_line(
+            f"[{label}] mode={result.get('mode', 'ok')} "
+            f"changes={result.get('changes_found', 0)} "
+            f"error={result.get('error', '-')}"
+        )
+        state = self._read_state(label) or {}
+        state["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         state["last_result"] = result
-        self._write_state(db_type, state)
+        self._write_state(label, state)
 
     # ------------------------------------------------------------------
     # rclone RC API(config/dump)로 OAuth 토큰 읽기
@@ -283,12 +329,11 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
     # 토큰을 포함한 remote 설정 전체를 JSON으로 그대로 돌려준다.
     # (참고: https://rclone.org/rc/ - "config/dump ... expose them")
     # ------------------------------------------------------------------
-    def _load_credentials(self, db_type):
+    def _load_credentials(self, db_type, remote_name):
         import requests
         from google.oauth2.credentials import Credentials
 
         cfg = self.get_plugin_config(db_type, default={})
-        remote_name = cfg.get("REMOTE_NAME") or "gdrive"
         rc_addr = cfg.get("RC_ADDR") or "http://localhost:5572"
         rc_user = cfg.get("RC_USER") or ""
         rc_pass = cfg.get("RC_PASS") or ""
@@ -301,7 +346,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         if remote_name not in all_remotes:
             raise RuntimeError(
                 f"rclone RC({rc_addr})의 config/dump 응답에 remote '{remote_name}'가 없습니다. "
-                f"REMOTE_NAME 설정값과 rclone에 등록된 이름이 일치하는지 확인하세요."
+                f"WATCH_TARGETS의 REMOTE_NAME과 rclone에 등록된 이름이 일치하는지 확인하세요."
             )
 
         section = all_remotes[remote_name]
@@ -362,7 +407,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         resp.raise_for_status()
         return resp.json()
 
-    def _notify_discord(self, db_type, change_lines):
+    def _notify_discord(self, db_type, label, change_lines):
         import requests
         cfg = self.get_plugin_config(db_type, default={})
         webhook_url = cfg.get("DISCORD_WEBHOOK_URL") or ""
@@ -372,7 +417,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         if len(body) > 1900:
             shown = change_lines[:20]
             body = "\n".join(shown) + f"\n...외 {len(change_lines) - len(shown)}건"
-        message = f"📁 구글 드라이브 변경 감지\n{body}"
+        message = f"📁 [{label}] 구글 드라이브 변경 감지\n{body}"
         try:
             resp = requests.post(webhook_url, json={"content": message}, timeout=15)
             resp.raise_for_status()
@@ -394,30 +439,37 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
 
     def _notify_startup(self, db_type):
         cfg = self.get_plugin_config(db_type, default={})
-        folder_id = cfg.get("DRIVE_FOLDER_ID") or "(미설정)"
+        targets = self._parse_watch_targets(cfg)
         interval = cfg.get("POLL_INTERVAL_SECONDS") or "15"
         cron = (cfg.get("CRON_SCHEDULE") or "").strip()
         schedule_desc = f"cron: {cron}" if cron else f"{interval}초 주기"
+        target_desc = "\n".join(
+            (f"- {t['label']}: {t.get('remote_name')}:{t.get('folder_id')}"
+             if not t.get("parse_error") else f"- {t['label']}: ⚠️ {t['parse_error']}")
+            for t in targets
+        ) or "(설정된 감시 대상 없음)"
         self._notify_simple(
             db_type,
-            f"🟢 gd_poller4bookoasis 감시 시작\n폴더 ID: {folder_id}\n주기: {schedule_desc}",
+            f"🟢 gd_poller4bookoasis 감시 시작 ({schedule_desc})\n{target_desc}",
         )
 
     # ------------------------------------------------------------------
-    # 핵심 로직 — 1회 점검 (APScheduler 잡 / 워치독 폴백 / 수동 실행 공용)
+    # 핵심 로직 — 타겟 1개 점검
     # ------------------------------------------------------------------
-    def check_once(self, db_type):
+    def check_target(self, db_type, target):
         from googleapiclient.discovery import build
 
-        cfg = self.get_plugin_config(db_type, default={})
-        folder_id = (cfg.get("DRIVE_FOLDER_ID") or "").strip()
-        if not folder_id:
-            return {"mode": "error", "error": "DRIVE_FOLDER_ID가 설정되지 않았습니다", "changes_found": 0}
+        label = target["label"]
+        if target.get("parse_error"):
+            return {"mode": "error", "error": target["parse_error"], "changes_found": 0}
 
-        creds = self._load_credentials(db_type)
+        remote_name = target["remote_name"]
+        folder_id = target["folder_id"]
+
+        creds = self._load_credentials(db_type, remote_name)
         drive = build("drive", "v3", credentials=creds)
 
-        state = self._read_state(db_type) or {}
+        state = self._read_state(label) or {}
 
         # 최초 실행 시에만 하위 트리 전체 인덱싱
         if "folder_ids" not in state or state.get("indexed_folder_id") != folder_id:
@@ -429,7 +481,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
                 "item_ids": list(item_ids),
                 "page_token": page_token,
             }
-            self._write_state(db_type, state)
+            self._write_state(label, state)
             return {"mode": "indexed", "changes_found": 0,
                     "note": f"초기 인덱싱 완료: 폴더 {len(folder_ids)}개, 항목 {len(item_ids)}개"}
 
@@ -476,20 +528,43 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         state["page_token"] = page_token
         run_count = int(state.get("run_count", 0)) + 1
         state["run_count"] = run_count
-        self._write_state(db_type, state)
+        self._write_state(label, state)
 
         if change_lines:
             self._call_rclone_rc_refresh(db_type)
-            self._notify_discord(db_type, change_lines)
+            self._notify_discord(db_type, label, change_lines)
         else:
+            cfg = self.get_plugin_config(db_type, default={})
             try:
                 heartbeat_n = int(cfg.get("HEARTBEAT_EVERY_N_RUNS") or 0)
             except (TypeError, ValueError):
                 heartbeat_n = 0
             if heartbeat_n > 0 and run_count % heartbeat_n == 0:
-                self._notify_simple(db_type, f"💓 gd_poller4bookoasis 정상 동작 중 (누적 {run_count}회 폴링, 변경 없음)")
+                self._notify_simple(db_type, f"💓 [{label}] 정상 동작 중 (누적 {run_count}회 폴링, 변경 없음)")
 
         return {"mode": "ok", "changes_found": len(change_lines), "changes": change_lines[:20]}
+
+    # ------------------------------------------------------------------
+    # WATCH_TARGETS 전체 순회 (APScheduler 잡 / 워치독 폴백 / 수동 실행 공용)
+    # ------------------------------------------------------------------
+    def check_all_targets(self, db_type):
+        cfg = self.get_plugin_config(db_type, default={})
+        targets = self._parse_watch_targets(cfg)
+
+        if not targets:
+            self._log_line("[전체] WATCH_TARGETS가 비어있습니다")
+            return []
+
+        results = []
+        for target in targets:
+            label = target["label"]
+            try:
+                result = self.check_target(db_type, target)
+            except Exception as e:
+                result = {"mode": "error", "error": str(e), "changes_found": 0}
+            self._log(label, result)
+            results.append({"label": label, **result})
+        return results
 
     # ------------------------------------------------------------------
     # 상태 데이터 (설정 화면 JS가 소비)
@@ -503,9 +578,25 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
             self._register_fallback_thread(db_type)
         self._ensure_watchdog(db_type)
 
-        state = self._read_state(db_type) or {}
-        last_run = state.get("last_run", "아직 실행 안 됨")
-        last_result = state.get("last_result") or {}
+        cfg = self.get_plugin_config(db_type, default={})
+        targets = self._parse_watch_targets(cfg)
+
+        per_target = []
+        for target in targets:
+            label = target["label"]
+            state = self._read_state(label) or {}
+            last_result = state.get("last_result") or {}
+            per_target.append({
+                "label": label,
+                "remote_name": target.get("remote_name"),
+                "folder_id": target.get("folder_id"),
+                "parse_error": target.get("parse_error"),
+                "last_run": state.get("last_run", "아직 실행 안 됨"),
+                "last_mode": last_result.get("mode", "-"),
+                "last_changes_found": last_result.get("changes_found", 0),
+                "run_count": state.get("run_count", 0),
+                "indexed": bool(state.get("folder_ids")),
+            })
 
         next_run = None
         scheduler_backend = "fallback_thread"
@@ -520,13 +611,9 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
 
         return {
             "success": True,
-            "last_run": last_run,
-            "last_mode": last_result.get("mode", "-"),
-            "last_changes_found": last_result.get("changes_found", 0),
-            "run_count": state.get("run_count", 0),
+            "targets": per_target,
             "next_run": next_run or "확인 불가 (폴백 스레드 모드)",
             "scheduler_backend": scheduler_backend,
-            "indexed": bool(state.get("folder_ids")),
         }
 
     def get_dashboard_data(self, db_type, limit=6):
@@ -540,9 +627,8 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
     # ------------------------------------------------------------------
     def handle_action(self, db_type, action, payload=None):
         if action == "check_now":
-            result = self.check_once(db_type)
-            self._log(db_type, result)
-            return {"success": True, "result": result}
+            results = self.check_all_targets(db_type)
+            return {"success": True, "results": results}
         return {"success": False, "error": f"알 수 없는 action: {action}"}
 
 
@@ -554,19 +640,20 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
 # 반면 "이 파일이 정상적으로 import된다"는 것은 코어의 플러그인 로드
 # 성공 여부(환경설정 > 플러그인 설정 화면의 로드 실패 목록)로 바로 확인
 # 가능한 확실한 지점이다. 그래서 on_enable을 기다리지 않고, 모듈이
-# import되는 즉시 알려진 DB 스코프 전부에 대해 스케줄러 잡 등록을
-# 시도한다. 플러그인이 실제로 비활성 상태여도 DRIVE_FOLDER_ID 등 필수
-# 설정이 비어있으면 check_once()가 에러 결과만 반환하고 조용히 끝나므로
-# 부작용은 없다.
+# import되는 즉시 잡 등록을 시도한다.
+#
+# 설정 저장소 자체가 "general" 스코프 하나뿐이라(실제 UI가 그렇게
+# 되어 있음) 그 스코프로만 잡을 등록한다. general/adult/audiobook
+# 여러 db를 감시하고 싶으면 스코프를 늘리는 게 아니라, WATCH_TARGETS
+# 설정 안에 "라벨:REMOTE_NAME:폴더ID" 줄을 여러 개 적으면 된다.
 # ------------------------------------------------------------------
-def _auto_register_all_scopes():
-    for _db_type in ("general", "adult", "audiobook"):
-        try:
-            _provider = GdPoller4BookOasisProvider()
-            _provider._register_job(_db_type)
-            _provider._ensure_watchdog(_db_type)
-        except Exception:
-            pass
+def _auto_register():
+    try:
+        _provider = GdPoller4BookOasisProvider()
+        _provider._register_job("general")
+        _provider._ensure_watchdog("general")
+    except Exception:
+        pass
 
 
-_auto_register_all_scopes()
+_auto_register()
