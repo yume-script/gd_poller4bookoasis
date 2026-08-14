@@ -407,8 +407,15 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         )
 
     def _collect_subtree_ids(self, drive, root_folder_id):
+        """
+        하위 트리 전체를 순회하며 폴더/전체 항목 ID뿐 아니라, 각 항목의
+        이름과 직속 부모 ID(item_meta)도 함께 수집한다. 이걸 저장해두면
+        나중에 변경 감지 시 "전체 경로(폴더/파일명)"를 추가 API 호출
+        없이 로컬에서 조립할 수 있다.
+        """
         folder_ids = {root_folder_id}
         all_item_ids = {root_folder_id}
+        item_meta = {}  # id -> {"name": str, "parent": parent_id or None, "is_folder": bool}
         queue = [root_folder_id]
         while queue:
             parent_id = queue.pop(0)
@@ -416,19 +423,42 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
             while True:
                 resp = drive.files().list(
                     q=f"'{parent_id}' in parents and trashed=false",
-                    fields="nextPageToken,files(id,mimeType)",
+                    fields="nextPageToken,files(id,name,mimeType)",
                     pageSize=1000,
                     pageToken=page_token,
                 ).execute()
                 for f in resp.get("files", []):
-                    all_item_ids.add(f["id"])
-                    if f.get("mimeType") == "application/vnd.google-apps.folder":
-                        folder_ids.add(f["id"])
-                        queue.append(f["id"])
+                    fid = f["id"]
+                    is_folder = f.get("mimeType") == "application/vnd.google-apps.folder"
+                    all_item_ids.add(fid)
+                    item_meta[fid] = {
+                        "name": f.get("name", fid),
+                        "parent": parent_id,
+                        "is_folder": is_folder,
+                    }
+                    if is_folder:
+                        folder_ids.add(fid)
+                        queue.append(fid)
                 page_token = resp.get("nextPageToken")
                 if not page_token:
                     break
-        return folder_ids, all_item_ids
+        return folder_ids, all_item_ids, item_meta
+
+    def _resolve_full_path(self, name, parent_id, item_meta, root_folder_id):
+        """item_meta 체인을 거슬러 올라가며 '상위폴더/하위폴더/파일명' 형태 경로를 조립"""
+        parts = []
+        seen = set()
+        cur = parent_id
+        while cur and cur != root_folder_id and cur not in seen:
+            seen.add(cur)
+            meta = item_meta.get(cur)
+            if not meta:
+                break
+            parts.append(meta["name"])
+            cur = meta.get("parent")
+        parts.reverse()
+        parts.append(name)
+        return "/".join(parts)
 
     def _call_rclone_rc_refresh(self, db_type):
         import requests
@@ -513,12 +543,13 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
 
         # 최초 실행 시에만 하위 트리 전체 인덱싱
         if "folder_ids" not in state or state.get("indexed_folder_id") != folder_id:
-            folder_ids, item_ids = self._collect_subtree_ids(drive, folder_id)
+            folder_ids, item_ids, item_meta = self._collect_subtree_ids(drive, folder_id)
             page_token = drive.changes().getStartPageToken().execute()["startPageToken"]
             state = {
                 "indexed_folder_id": folder_id,
                 "folder_ids": list(folder_ids),
                 "item_ids": list(item_ids),
+                "item_meta": item_meta,
                 "page_token": page_token,
             }
             self._write_state(state_key, state)
@@ -527,6 +558,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
 
         folder_ids = set(state["folder_ids"])
         item_ids = set(state["item_ids"])
+        item_meta = state.get("item_meta", {})
         page_token = state["page_token"]
 
         # ------------------------------------------------------------
@@ -548,7 +580,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
             request = drive.changes().list_next(request, response)
 
         # ------------------------------------------------------------
-        # 2단계: 폴더 생성 이벤트부터 folder_ids에 반영 (fixed-point).
+        # 2단계: 폴더 생성 이벤트부터 folder_ids/item_meta에 반영 (fixed-point).
         #
         # Drive Changes API는 이벤트 순서를 "부모 폴더가 먼저"로 보장하지
         # 않는다. 깊은 하위 폴더 구조를 한 번에 업로드하면(예: 5단계
@@ -556,6 +588,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         # 이벤트보다 먼저 올 수도 있다. 한 번에 다 모아놓고, 새로 생긴
         # 폴더들을 (더 이상 새로 편입되는 폴더가 없을 때까지) 반복
         # 반영한 뒤에 파일 변경을 판정해야 깊은 곳의 변경을 놓치지 않는다.
+        # item_meta도 같이 채워야 나중에 전체 경로를 조립할 수 있다.
         # ------------------------------------------------------------
         changed = True
         while changed:
@@ -572,12 +605,18 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
                 parents = file_info.get("parents", [])
                 if any(p in folder_ids for p in parents):
                     folder_ids.add(file_id)
+                    item_meta[file_id] = {
+                        "name": file_info.get("name", file_id),
+                        "parent": parents[0] if parents else None,
+                        "is_folder": True,
+                    }
                     changed = True
 
         # ------------------------------------------------------------
-        # 3단계: 완성된 folder_ids 기준으로 최종 판정
+        # 3단계: 완성된 folder_ids/item_meta 기준으로 최종 판정 + 전체 경로 조립
         # ------------------------------------------------------------
         change_lines = []
+        changed_paths = []  # 가공용 원본 데이터: [{"path": ..., "removed": bool}, ...]
         for ch in raw_changes:
             file_id = ch["fileId"]
             removed = ch.get("removed", False)
@@ -588,17 +627,34 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
                 if file_id in item_ids:
                     item_ids.discard(file_id)
                     folder_ids.discard(file_id)
-                    change_lines.append(f"🗑️ 삭제: {file_id}")
+                    cached = item_meta.pop(file_id, None)
+                    if cached:
+                        full_path = self._resolve_full_path(
+                            cached["name"], cached.get("parent"), item_meta, folder_id
+                        )
+                    else:
+                        full_path = file_id  # 캐시에도 없으면 ID로 대체
+                    change_lines.append(f"🗑️ 삭제: {full_path}")
+                    changed_paths.append({"path": full_path, "removed": True})
                 continue
 
             if any(p in folder_ids for p in parents):
                 item_ids.add(file_id)
                 name = file_info.get("name", file_id)
-                change_lines.append(f"✏️ 변경: {name}")
+                parent_id = parents[0] if parents else None
+                item_meta[file_id] = {
+                    "name": name,
+                    "parent": parent_id,
+                    "is_folder": file_info.get("mimeType") == "application/vnd.google-apps.folder",
+                }
+                full_path = self._resolve_full_path(name, parent_id, item_meta, folder_id)
+                change_lines.append(f"✏️ 변경: {full_path}")
+                changed_paths.append({"path": full_path, "removed": False})
 
-        # 상태 갱신 (인덱스 정보는 유지, page_token/집합만 업데이트)
+        # 상태 갱신 (인덱스 정보는 유지, page_token/집합/메타 업데이트)
         state["folder_ids"] = list(folder_ids)
         state["item_ids"] = list(item_ids)
+        state["item_meta"] = item_meta
         state["page_token"] = page_token
         run_count = int(state.get("run_count", 0)) + 1
         state["run_count"] = run_count
@@ -616,7 +672,12 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
             if heartbeat_n > 0 and run_count % heartbeat_n == 0:
                 self._notify_simple(db_type, f"💓 [{display_label}] 정상 동작 중 (누적 {run_count}회 폴링, 변경 없음)")
 
-        return {"mode": "ok", "changes_found": len(change_lines), "changes": change_lines[:20]}
+        return {
+            "mode": "ok",
+            "changes_found": len(change_lines),
+            "changes": change_lines[:20],
+            "changed_paths": changed_paths[:50],
+        }
 
     # ------------------------------------------------------------------
     # WATCH_TARGET_1~5 전체 순회 (APScheduler 잡 / 워치독 폴백 / 수동 실행 공용)
