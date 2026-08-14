@@ -42,7 +42,6 @@ import os
 import json
 import time
 import threading
-import configparser
 from datetime import datetime
 
 from plugins.metadata.base import BaseMetadataProvider
@@ -67,8 +66,6 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
     is_searchable = False
 
     config_schema = [
-        {"key": "RCLONE_CONFIG_PATH", "label": "rclone.conf 경로", "type": "text",
-         "required": False, "default": "~/.config/rclone/rclone.conf"},
         {"key": "REMOTE_NAME", "label": "rclone remote 이름", "type": "text",
          "required": True, "default": "gdrive"},
         {"key": "DRIVE_FOLDER_ID", "label": "감시할 구글 드라이브 폴더 ID", "type": "text",
@@ -276,32 +273,42 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         self._write_state(db_type, state)
 
     # ------------------------------------------------------------------
-    # rclone.conf에서 OAuth 토큰 읽기
+    # rclone RC API(config/dump)로 OAuth 토큰 읽기
+    # 도커 환경에서는 컨테이너 안에 rclone.conf 파일을 두거나 경로를
+    # 맞추는 게 번거로우므로, 파일을 직접 읽지 않고 이미 설정되어 있는
+    # RC_ADDR로 rclone에게 직접 물어본다. rclone rc의 config/dump는
+    # 토큰을 포함한 remote 설정 전체를 JSON으로 그대로 돌려준다.
+    # (참고: https://rclone.org/rc/ - "config/dump ... expose them")
     # ------------------------------------------------------------------
     def _load_credentials(self, db_type):
+        import requests
         from google.oauth2.credentials import Credentials
 
         cfg = self.get_plugin_config(db_type, default={})
-        config_path = os.path.expanduser(cfg.get("RCLONE_CONFIG_PATH") or "~/.config/rclone/rclone.conf")
         remote_name = cfg.get("REMOTE_NAME") or "gdrive"
+        rc_addr = cfg.get("RC_ADDR") or "http://localhost:5572"
+        rc_user = cfg.get("RC_USER") or ""
+        rc_pass = cfg.get("RC_PASS") or ""
+        auth = (rc_user, rc_pass) if rc_user else None
 
-        if not os.path.isfile(config_path):
-            raise RuntimeError(f"rclone.conf를 찾을 수 없습니다: {config_path}")
+        resp = requests.post(f"{rc_addr}/config/dump", auth=auth, timeout=15)
+        resp.raise_for_status()
+        all_remotes = resp.json()
 
-        parser = configparser.ConfigParser()
-        parser.read(config_path)
+        if remote_name not in all_remotes:
+            raise RuntimeError(
+                f"rclone RC({rc_addr})의 config/dump 응답에 remote '{remote_name}'가 없습니다. "
+                f"REMOTE_NAME 설정값과 rclone에 등록된 이름이 일치하는지 확인하세요."
+            )
 
-        if remote_name not in parser:
-            raise RuntimeError(f"rclone.conf에 [{remote_name}] 섹션이 없습니다")
-
-        section = parser[remote_name]
+        section = all_remotes[remote_name]
         client_id = section.get("client_id") or None
         client_secret = section.get("client_secret") or None
         token_raw = section.get("token")
         if not token_raw:
-            raise RuntimeError(f"[{remote_name}] 섹션에 token 정보가 없습니다")
+            raise RuntimeError(f"remote '{remote_name}'에 token 정보가 없습니다 (rclone에서 인증이 안 된 상태일 수 있음)")
 
-        token_data = json.loads(token_raw)
+        token_data = json.loads(token_raw) if isinstance(token_raw, str) else token_raw
         return Credentials(
             token=token_data.get("access_token"),
             refresh_token=token_data.get("refresh_token"),
