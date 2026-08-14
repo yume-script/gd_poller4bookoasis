@@ -529,7 +529,11 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         item_ids = set(state["item_ids"])
         page_token = state["page_token"]
 
-        change_lines = []
+        # ------------------------------------------------------------
+        # 1단계: 이번 폴링에서 온 변경 이벤트를 전부 모으기만 한다.
+        # (바로바로 판정하지 않는 이유는 아래 2단계 설명 참고)
+        # ------------------------------------------------------------
+        raw_changes = []
         request = drive.changes().list(
             pageToken=page_token,
             spaces="drive",
@@ -538,29 +542,59 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         )
         while request is not None:
             response = request.execute()
-            for ch in response.get("changes", []):
-                file_id = ch["fileId"]
-                removed = ch.get("removed", False)
-                file_info = ch.get("file") or {}
-                parents = file_info.get("parents", [])
-
-                if removed:
-                    if file_id in item_ids:
-                        item_ids.discard(file_id)
-                        folder_ids.discard(file_id)
-                        change_lines.append(f"🗑️ 삭제: {file_id}")
-                    continue
-
-                if any(p in folder_ids for p in parents):
-                    item_ids.add(file_id)
-                    if file_info.get("mimeType") == "application/vnd.google-apps.folder":
-                        folder_ids.add(file_id)
-                    name = file_info.get("name", file_id)
-                    change_lines.append(f"✏️ 변경: {name}")
-
+            raw_changes.extend(response.get("changes", []))
             if "newStartPageToken" in response:
                 page_token = response["newStartPageToken"]
             request = drive.changes().list_next(request, response)
+
+        # ------------------------------------------------------------
+        # 2단계: 폴더 생성 이벤트부터 folder_ids에 반영 (fixed-point).
+        #
+        # Drive Changes API는 이벤트 순서를 "부모 폴더가 먼저"로 보장하지
+        # 않는다. 깊은 하위 폴더 구조를 한 번에 업로드하면(예: 5단계
+        # 중첩), 손자 폴더의 파일 변경 이벤트가 그 부모 폴더의 생성
+        # 이벤트보다 먼저 올 수도 있다. 한 번에 다 모아놓고, 새로 생긴
+        # 폴더들을 (더 이상 새로 편입되는 폴더가 없을 때까지) 반복
+        # 반영한 뒤에 파일 변경을 판정해야 깊은 곳의 변경을 놓치지 않는다.
+        # ------------------------------------------------------------
+        changed = True
+        while changed:
+            changed = False
+            for ch in raw_changes:
+                if ch.get("removed"):
+                    continue
+                file_info = ch.get("file") or {}
+                if file_info.get("mimeType") != "application/vnd.google-apps.folder":
+                    continue
+                file_id = ch["fileId"]
+                if file_id in folder_ids:
+                    continue
+                parents = file_info.get("parents", [])
+                if any(p in folder_ids for p in parents):
+                    folder_ids.add(file_id)
+                    changed = True
+
+        # ------------------------------------------------------------
+        # 3단계: 완성된 folder_ids 기준으로 최종 판정
+        # ------------------------------------------------------------
+        change_lines = []
+        for ch in raw_changes:
+            file_id = ch["fileId"]
+            removed = ch.get("removed", False)
+            file_info = ch.get("file") or {}
+            parents = file_info.get("parents", [])
+
+            if removed:
+                if file_id in item_ids:
+                    item_ids.discard(file_id)
+                    folder_ids.discard(file_id)
+                    change_lines.append(f"🗑️ 삭제: {file_id}")
+                continue
+
+            if any(p in folder_ids for p in parents):
+                item_ids.add(file_id)
+                name = file_info.get("name", file_id)
+                change_lines.append(f"✏️ 변경: {name}")
 
         # 상태 갱신 (인덱스 정보는 유지, page_token/집합만 업데이트)
         state["folder_ids"] = list(folder_ids)
