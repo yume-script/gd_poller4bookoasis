@@ -692,16 +692,22 @@ def _auto_register():
     except Exception:
         pass
 
-    # 예전 버전(general/adult/audiobook 3중 자동 등록)에서 만들어진
-    # 유령 잡 정리. 스케줄러가 영속 저장소를 쓰는 경우 재시작해도 이
-    # 잡들이 안 지워지고 계속 실행되면서 낡은 에러를 반복 출력하는
-    # 문제가 있어 명시적으로 제거한다.
+    # 예전 버전에서 만들어진 유령 잡 정리. 스케줄러가 영속 저장소를 쓰는
+    # 경우 재시작해도 이 잡들이 안 지워지고 계속 실행되면서 낡은 에러를
+    # 반복 출력하는 문제가 있어 명시적으로 제거한다. 실제 스코프
+    # 식별자가 "adult"/"audiobook"이 아니라 core가 쓰는 다른 이름
+    # (예: "media_adult")일 수도 있으므로, 이름을 짐작하지 않고
+    # "gd_poller4bookoasis_"로 시작하는 잡 중 우리가 지금 쓰는
+    # general 잡이 아닌 건 전부 제거한다.
     try:
         from services.scheduler_service import scheduler
-        for _stale_db_type in ("adult", "audiobook"):
-            _stale_job_id = GdPoller4BookOasisProvider._job_id(_stale_db_type)
-            if scheduler.get_job(_stale_job_id):
-                scheduler.remove_job(_stale_job_id)
+        _keep_job_id = GdPoller4BookOasisProvider._job_id("general")
+        for _job in list(scheduler.get_jobs()):
+            if _job.id.startswith("gd_poller4bookoasis_") and _job.id != _keep_job_id:
+                try:
+                    scheduler.remove_job(_job.id)
+                except Exception:
+                    pass
     except Exception:
         pass
 
