@@ -7,7 +7,8 @@
   .gp-hint { opacity: 0.7; font-size: 12.5px; margin: 4px 0 8px 0; }
   .gp-settings-field { margin-bottom: 8px; }
   .gp-settings-field label { display: block; font-weight: 600; margin-bottom: 4px; }
-  .gp-settings-field input { width: 100%; box-sizing: border-box; padding: 6px 8px; border-radius: 6px; border: 1px solid rgba(128,128,128,0.35); background: transparent; }
+  .gp-settings-field input { width: 100%; box-sizing: border-box; padding: 6px 8px; border-radius: 6px; border: 1px solid rgba(128,128,128,0.35); background: rgba(255,255,255,0.06); color: inherit; }
+  .gp-settings-field input::placeholder { color: inherit; opacity: 0.45; }
   .gp-field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   .gp-divider { height: 1px; background: rgba(128,128,128,0.25); margin: 10px 0; }
   .gp-btn { padding: 7px 14px; border-radius: 6px; border: 1px solid rgba(128,128,128,0.35); cursor: pointer; font-weight: 600; }
@@ -133,7 +134,7 @@
         <div class="gp-settings-field">
           <label for="gp-discord">디스코드 웹훅 URL</label>
           <div class="gp-input-container">
-            <input id="gp-discord" type="password" name="DISCORD_WEBHOOK_URL" placeholder="비우면 알림 없음" />
+            <input id="gp-discord" type="text" name="DISCORD_WEBHOOK_URL" placeholder="비우면 알림 없음" />
           </div>
         </div>
       </section>
