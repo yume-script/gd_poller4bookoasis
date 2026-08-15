@@ -412,6 +412,15 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         이름과 직속 부모 ID(item_meta)도 함께 수집한다. 이걸 저장해두면
         나중에 변경 감지 시 "전체 경로(폴더/파일명)"를 추가 API 호출
         없이 로컬에서 조립할 수 있다.
+
+        구글드라이브 "바로가기(shortcut)"는 mimeType이 폴더가 아니라
+        application/vnd.google-apps.shortcut이라서, 그냥 두면 그 안쪽을
+        전혀 순회하지 못하고 실제 대상 폴더의 ID도 감시 목록에 안 들어간다
+        (Drive Changes API는 바로가기가 아니라 실제 파일의 진짜 위치
+        ID로 변경을 알려주기 때문에, 그 ID를 모르면 변경이 조용히
+        무시된다). 그래서 바로가기를 만나면 shortcutDetails로 실제
+        대상(target)을 확인해서, 대상이 폴더면 그 실제 ID까지 따라
+        들어가서 계속 순회한다.
         """
         folder_ids = {root_folder_id}
         all_item_ids = {root_folder_id}
@@ -423,19 +432,35 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
             while True:
                 resp = drive.files().list(
                     q=f"'{parent_id}' in parents and trashed=false",
-                    fields="nextPageToken,files(id,name,mimeType)",
+                    fields="nextPageToken,files(id,name,mimeType,shortcutDetails)",
                     pageSize=1000,
                     pageToken=page_token,
                 ).execute()
                 for f in resp.get("files", []):
                     fid = f["id"]
-                    is_folder = f.get("mimeType") == "application/vnd.google-apps.folder"
+                    mime = f.get("mimeType")
+                    name = f.get("name", fid)
+
+                    if mime == "application/vnd.google-apps.shortcut":
+                        shortcut = f.get("shortcutDetails") or {}
+                        target_id = shortcut.get("targetId")
+                        target_mime = shortcut.get("targetMimeType")
+                        if target_id and target_mime == "application/vnd.google-apps.folder":
+                            # 바로가기가 가리키는 실제 폴더 ID로 등록하고 그 안까지 순회
+                            if target_id not in folder_ids:
+                                all_item_ids.add(target_id)
+                                item_meta[target_id] = {"name": name, "parent": parent_id, "is_folder": True}
+                                folder_ids.add(target_id)
+                                queue.append(target_id)
+                            continue
+                        # 폴더가 아닌 대상(파일)에 대한 바로가기는 그냥 일반 항목으로만 기록
+                        all_item_ids.add(fid)
+                        item_meta[fid] = {"name": name, "parent": parent_id, "is_folder": False}
+                        continue
+
+                    is_folder = mime == "application/vnd.google-apps.folder"
                     all_item_ids.add(fid)
-                    item_meta[fid] = {
-                        "name": f.get("name", fid),
-                        "parent": parent_id,
-                        "is_folder": is_folder,
-                    }
+                    item_meta[fid] = {"name": name, "parent": parent_id, "is_folder": is_folder}
                     if is_folder:
                         folder_ids.add(fid)
                         queue.append(fid)
@@ -570,7 +595,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
             pageToken=page_token,
             spaces="drive",
             fields="nextPageToken,newStartPageToken,"
-                   "changes(fileId,removed,file(name,parents,mimeType))",
+                   "changes(fileId,removed,file(name,parents,mimeType,shortcutDetails))",
         )
         while request is not None:
             response = request.execute()
@@ -589,6 +614,11 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         # 폴더들을 (더 이상 새로 편입되는 폴더가 없을 때까지) 반복
         # 반영한 뒤에 파일 변경을 판정해야 깊은 곳의 변경을 놓치지 않는다.
         # item_meta도 같이 채워야 나중에 전체 경로를 조립할 수 있다.
+        #
+        # 바로가기(shortcut)도 여기서 같이 처리한다: 새로 생긴 바로가기가
+        # 폴더를 가리키면, 그 바로가기 자체의 ID가 아니라 실제 대상
+        # 폴더의 ID를 folder_ids에 등록해야 한다 (자세한 이유는 초기
+        # 인덱싱 함수 _collect_subtree_ids의 docstring 참고).
         # ------------------------------------------------------------
         changed = True
         while changed:
@@ -597,20 +627,42 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
                 if ch.get("removed"):
                     continue
                 file_info = ch.get("file") or {}
-                if file_info.get("mimeType") != "application/vnd.google-apps.folder":
-                    continue
-                file_id = ch["fileId"]
-                if file_id in folder_ids:
-                    continue
+                mime = file_info.get("mimeType")
                 parents = file_info.get("parents", [])
-                if any(p in folder_ids for p in parents):
-                    folder_ids.add(file_id)
-                    item_meta[file_id] = {
-                        "name": file_info.get("name", file_id),
-                        "parent": parents[0] if parents else None,
-                        "is_folder": True,
-                    }
-                    changed = True
+                file_id = ch["fileId"]
+
+                if mime == "application/vnd.google-apps.folder":
+                    if file_id in folder_ids:
+                        continue
+                    if any(p in folder_ids for p in parents):
+                        folder_ids.add(file_id)
+                        item_meta[file_id] = {
+                            "name": file_info.get("name", file_id),
+                            "parent": parents[0] if parents else None,
+                            "is_folder": True,
+                        }
+                        changed = True
+                    continue
+
+                if mime == "application/vnd.google-apps.shortcut":
+                    # 바로가기가 폴더를 가리키면, 그 실제 대상 폴더 ID를
+                    # folder_ids에 등록해야 그 안의 변경도 잡을 수 있다
+                    # (§ 하단 3단계 주석 참고: Changes API는 대상의 진짜
+                    # ID로 변경을 알려주기 때문).
+                    shortcut = file_info.get("shortcutDetails") or {}
+                    target_id = shortcut.get("targetId")
+                    target_mime = shortcut.get("targetMimeType")
+                    if (target_id and target_mime == "application/vnd.google-apps.folder"
+                            and target_id not in folder_ids
+                            and any(p in folder_ids for p in parents)):
+                        folder_ids.add(target_id)
+                        item_meta[target_id] = {
+                            "name": file_info.get("name", target_id),
+                            "parent": parents[0] if parents else None,
+                            "is_folder": True,
+                        }
+                        changed = True
+                    continue
 
         # ------------------------------------------------------------
         # 3단계: 완성된 folder_ids/item_meta 기준으로 최종 판정 + 전체 경로 조립
