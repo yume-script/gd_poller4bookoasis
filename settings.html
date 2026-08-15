@@ -162,6 +162,76 @@
         <div id="gp-save-result" class="gp-save-result"></div>
       </section>
 
+      <!-- BookOasis 스캔 웹훅 -->
+      <section class="gp-card">
+        <h3 class="gp-card-title">📚 BookOasis 스캔 알림 (선택)</h3>
+        <p class="gp-hint">
+          변경 감지 시 BookOasis의 /api/webhook/scan을 호출해 해당 폴더만 즉시 스캔합니다.
+          비워두면 이 기능은 스킵됩니다.
+        </p>
+
+        <div class="gp-settings-field">
+          <label for="gp-wh-base">BookOasis 주소</label>
+          <div class="gp-input-container">
+            <input id="gp-wh-base" type="text" name="WEBHOOK_BASE_URL" placeholder="http://localhost:5930" />
+          </div>
+        </div>
+
+        <div class="gp-settings-field">
+          <label for="gp-wh-token">WEBHOOK_TOKEN (.env와 동일)</label>
+          <div class="gp-input-container">
+            <input id="gp-wh-token" type="password" name="WEBHOOK_TOKEN" placeholder="" />
+          </div>
+        </div>
+
+        <div class="gp-divider"></div>
+        <p class="gp-hint">
+          아래 라이브러리 ID/타입을 직접 안 채우면, 관리자 계정으로 자동탐지를 시도합니다
+          (변경된 파일 경로와 라이브러리의 physical_path를 대조해서 자동으로 찾음).
+        </p>
+
+        <div class="gp-field-grid">
+          <div class="gp-settings-field">
+            <label for="gp-wh-admin-user">관리자 계정 (자동탐지용)</label>
+            <div class="gp-input-container">
+              <input id="gp-wh-admin-user" type="text" name="WEBHOOK_ADMIN_USERNAME" placeholder="" />
+            </div>
+          </div>
+          <div class="gp-settings-field">
+            <label for="gp-wh-admin-pass">관리자 비밀번호</label>
+            <div class="gp-input-container">
+              <input id="gp-wh-admin-pass" type="password" name="WEBHOOK_ADMIN_PASSWORD" placeholder="" />
+            </div>
+          </div>
+        </div>
+
+        <div class="gp-divider"></div>
+        <p class="gp-hint">아래 두 값을 직접 채우면 자동탐지 대신 이 값을 그대로 사용합니다 (수동 지정 우선).</p>
+
+        <div class="gp-field-grid">
+          <div class="gp-settings-field">
+            <label for="gp-wh-library">대상 라이브러리 ID (수동, 선택)</label>
+            <div class="gp-input-container">
+              <input id="gp-wh-library" type="text" name="WEBHOOK_LIBRARY_ID" placeholder="자동탐지 사용 시 비워두기" />
+            </div>
+          </div>
+          <div class="gp-settings-field">
+            <label for="gp-wh-dbtype">DB 스코프 (수동 지정 시에만 사용)</label>
+            <div class="gp-input-container">
+              <input id="gp-wh-dbtype" type="text" name="WEBHOOK_DB_TYPE" placeholder="general" />
+            </div>
+          </div>
+        </div>
+
+        <div class="gp-settings-field">
+          <label for="gp-wh-prefix">도서 위치 접두 경로</label>
+          <div class="gp-input-container">
+            <input id="gp-wh-prefix" type="text" name="WEBHOOK_PATH_PREFIX" placeholder="/mnt/gds2/GDRIVE/READING" />
+            <p class="hint">구글드라이브 감시 루트가 실제로 마운트된 절대경로입니다. 자동탐지를 쓰면 이 값 + 상대경로로 만든 절대경로를 라이브러리 physical_path와 대조하니, 여기는 정확한 절대경로를 넣어야 합니다.</p>
+          </div>
+        </div>
+      </section>
+
     </div>
   </details>
 </div>

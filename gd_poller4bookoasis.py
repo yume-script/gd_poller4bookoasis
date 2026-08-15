@@ -130,6 +130,21 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
          "type": "text", "required": False, "default": "15"},
         {"key": "HEARTBEAT_EVERY_N_RUNS", "label": "하트비트 알림 주기 (N번 폴링마다 1번, 0=끔)",
          "type": "text", "required": False, "default": "0"},
+        {"key": "WEBHOOK_BASE_URL", "label": "BookOasis 주소 (예: http://localhost:5930)",
+         "type": "text", "required": False, "default": "http://localhost:5930"},
+        {"key": "WEBHOOK_TOKEN", "label": "BookOasis WEBHOOK_TOKEN (.env와 동일한 값)",
+         "type": "password", "required": False, "default": ""},
+        {"key": "WEBHOOK_ADMIN_USERNAME", "label": "관리자 계정 (라이브러리 ID/타입 자동탐지용, 선택)",
+         "type": "text", "required": False, "default": ""},
+        {"key": "WEBHOOK_ADMIN_PASSWORD", "label": "관리자 비밀번호 (자동탐지용, 선택)",
+         "type": "password", "required": False, "default": ""},
+        {"key": "WEBHOOK_LIBRARY_ID", "label": "대상 라이브러리 ID (수동 지정, 비우면 자동탐지 사용)",
+         "type": "text", "required": False, "default": ""},
+        {"key": "WEBHOOK_DB_TYPE", "label": "라이브러리 DB 스코프 (수동 지정 시에만 사용)",
+         "type": "text", "required": False, "default": "general"},
+        {"key": "WEBHOOK_PATH_PREFIX",
+         "label": "도서 위치 접두 경로 (구글드라이브 감시 루트에 대응하는 실제 마운트 절대경로)",
+         "type": "text", "required": False, "default": "/mnt/gds2/GDRIVE/READING"},
     ]
 
     update_manifest = {
@@ -606,6 +621,165 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         resp.raise_for_status()
         return resp.json()
 
+    _library_map_cache = {}  # base_url -> {"fetched_at": float, "entries": [...]}
+    _library_map_lock = threading.Lock()
+
+    def _fetch_library_map(self, base_url, username, password):
+        """
+        관리자 세션으로 로그인해서 general/adult 스코프의 라이브러리
+        목록(id, type, physical_path 루트들)을 가져온다.
+        /api/media/libraries/schedules는 세션 쿠키(@admin_required) 인증이라
+        WEBHOOK_TOKEN과는 별개로 관리자 계정이 필요하다.
+        """
+        import requests
+
+        session = requests.Session()
+        resp = session.post(
+            f"{base_url}/login",
+            data={"username": username, "password": password},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        login_data = resp.json()
+        if not login_data.get("success"):
+            raise RuntimeError(f"관리자 로그인 실패: {login_data.get('error', '알 수 없는 오류')}")
+
+        entries = []
+        for scope in ("general", "adult"):
+            resp = session.get(
+                f"{base_url}/api/media/libraries/schedules",
+                params={"type": scope},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            for lib in data.get("libraries", []):
+                roots = [r.strip() for r in (lib.get("physical_path") or "").splitlines() if r.strip()]
+                entries.append({
+                    "library_id": lib.get("id"),
+                    "type": scope,
+                    "roots": roots,
+                })
+        return entries
+
+    def _get_library_map(self, db_type, base_url):
+        """10분 캐시로 라이브러리 맵을 재사용 (매 폴링마다 로그인하지 않도록)"""
+        cfg = self.get_plugin_config(db_type, default={})
+        username = cfg.get("WEBHOOK_ADMIN_USERNAME") or ""
+        password = cfg.get("WEBHOOK_ADMIN_PASSWORD") or ""
+        if not username or not password:
+            return None
+
+        with GdPoller4BookOasisProvider._library_map_lock:
+            cached = GdPoller4BookOasisProvider._library_map_cache.get(base_url)
+            if cached and (time.time() - cached["fetched_at"]) < 600:
+                return cached["entries"]
+
+        try:
+            entries = self._fetch_library_map(base_url, username, password)
+        except Exception as e:
+            self._log_line(f"[전체] 라이브러리 자동탐지 실패: {e}")
+            return None
+
+        with GdPoller4BookOasisProvider._library_map_lock:
+            GdPoller4BookOasisProvider._library_map_cache[base_url] = {
+                "fetched_at": time.time(),
+                "entries": entries,
+            }
+        return entries
+
+    @staticmethod
+    def _match_library(full_path, entries):
+        """full_path(절대경로)와 가장 길게 일치하는 라이브러리 루트를 찾아
+        (library_id, type, 그 라이브러리 기준 상대경로)를 반환. 없으면 None."""
+        best = None  # (root_len, library_id, type, relative_path)
+        for entry in entries:
+            for root in entry["roots"]:
+                root_norm = root.rstrip("/")
+                if full_path == root_norm:
+                    relative = ""
+                elif full_path.startswith(root_norm + "/"):
+                    relative = full_path[len(root_norm) + 1:]
+                else:
+                    continue
+                if best is None or len(root_norm) > best[0]:
+                    best = (len(root_norm), entry["library_id"], entry["type"], relative)
+        if best is None:
+            return None
+        return best[1], best[2], best[3]
+
+    def _notify_bookoasis_scan(self, db_type, changed_paths):
+        """
+        신규/변경/삭제된 항목들의 상위 폴더를 모아 BookOasis의
+        /api/webhook/scan (path 지정 시 폴더 단위 즉시 동기 스캔)을
+        호출한다.
+
+        라이브러리 ID/타입 결정 순서:
+          1) WEBHOOK_LIBRARY_ID를 수동으로 설정해뒀으면 그 값을 그대로 사용
+          2) 아니면 WEBHOOK_ADMIN_USERNAME/PASSWORD로 관리자 세션 로그인 후
+             /api/media/libraries/schedules에서 physical_path 목록을 가져와,
+             변경된 파일의 절대경로와 가장 길게 일치하는 라이브러리를 자동
+             탐지 (이 경우 path도 그 라이브러리 기준 상대경로로 정확히 계산됨)
+          3) 어느 쪽도 안 되면 조용히 스킵 (선택 기능)
+
+        주의: path는 반드시 "폴더" 경로여야 한다 (파일 경로를 넘기면
+        os.walk()가 아무것도 못 찾아 조용히 무동작한다). 그래서 바뀐 항목이
+        파일이든 폴더든 항상 그 "상위 폴더" 경로를 쓴다. 같은 폴더에 여러
+        변경이 몰리면 한 번만 호출한다 (중복 제거).
+        """
+        import requests
+
+        cfg = self.get_plugin_config(db_type, default={})
+        base_url = (cfg.get("WEBHOOK_BASE_URL") or "").rstrip("/")
+        token = cfg.get("WEBHOOK_TOKEN") or ""
+        prefix = (cfg.get("WEBHOOK_PATH_PREFIX") or "").rstrip("/")
+        manual_library_id = cfg.get("WEBHOOK_LIBRARY_ID") or ""
+        manual_db_type = cfg.get("WEBHOOK_DB_TYPE") or "general"
+
+        if not base_url or not token:
+            return  # 웹훅 설정이 비어있으면 조용히 스킵 (선택 기능)
+
+        library_map = None if manual_library_id else self._get_library_map(db_type, base_url)
+        if not manual_library_id and not library_map:
+            return  # 수동 지정도 없고 자동탐지도 안 되면 스킵
+
+        # 각 변경 항목의 "상위 폴더" 절대경로만 뽑아서 중복 제거
+        full_parent_paths = set()
+        for item in changed_paths:
+            path = item.get("path") or ""
+            parent = path.rsplit("/", 1)[0] if "/" in path else ""
+            full_path = f"{prefix}/{parent}".rstrip("/") if parent else prefix
+            full_parent_paths.add(full_path)
+
+        for full_path in full_parent_paths:
+            if manual_library_id:
+                library_id, webhook_db_type, relative_path = manual_library_id, manual_db_type, full_path
+            else:
+                matched = self._match_library(full_path, library_map)
+                if not matched:
+                    self._log_line(f"[전체] BookOasis scan-path 스킵 (일치하는 라이브러리 없음): {full_path}")
+                    continue
+                library_id, webhook_db_type, relative_path = matched
+
+            try:
+                resp = requests.get(
+                    f"{base_url}/api/webhook/scan",
+                    params={
+                        "token": token,
+                        "library_id": library_id,
+                        "type": webhook_db_type,
+                        "path": relative_path,
+                    },
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                self._log_line(
+                    f"[전체] BookOasis scan-path 요청: lib={library_id}({webhook_db_type}) "
+                    f"path={relative_path} -> {resp.json()}"
+                )
+            except requests.RequestException as e:
+                self._log_line(f"[전체] BookOasis scan-path 요청 실패({full_path}): {e}")
+
     def _notify_discord(self, db_type, display_label, change_lines):
         import requests
         cfg = self.get_plugin_config(db_type, default={})
@@ -819,6 +993,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         if change_lines:
             self._call_rclone_rc_refresh(db_type)
             self._notify_discord(db_type, display_label, change_lines)
+            self._notify_bookoasis_scan(db_type, changed_paths)
         else:
             cfg = self.get_plugin_config(db_type, default={})
             try:
