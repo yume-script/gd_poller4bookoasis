@@ -815,11 +815,17 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         except Exception:
             pass
 
+        try:
+            log_size_bytes = os.path.getsize(self._log_path())
+        except OSError:
+            log_size_bytes = 0
+
         return {
             "success": True,
             "targets": per_target,
             "next_run": next_run or "확인 불가 (폴백 스레드 모드)",
             "scheduler_backend": scheduler_backend,
+            "log_size_bytes": log_size_bytes,
         }
 
     def get_dashboard_data(self, db_type, limit=6):
@@ -828,13 +834,19 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         return status
 
     # ------------------------------------------------------------------
-    # 설정 화면의 "지금 즉시 확인" 버튼이 호출할 액션
+    # 설정 화면의 "지금 즉시 확인" / "로그 지우기" 버튼이 호출할 액션
     # (코어에 커스텀 액션 라우트가 있다는 전제 - cache_cleaner와 동일한 제약)
     # ------------------------------------------------------------------
     def handle_action(self, db_type, action, payload=None):
         if action == "check_now":
             results = self.check_all_targets(db_type)
             return {"success": True, "results": results}
+        if action == "clear_log":
+            try:
+                open(self._log_path(), "w", encoding="utf-8").close()
+                return {"success": True}
+            except OSError as e:
+                return {"success": False, "error": f"로그 파일 삭제 실패: {e}"}
         return {"success": False, "error": f"알 수 없는 action: {action}"}
 
 
