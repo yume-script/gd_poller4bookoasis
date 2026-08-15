@@ -53,13 +53,26 @@ Drive Changes API의 page_token만 이어서 사용한다. 이 상태는 타겟�
 조합으로 잡는 이유는, 서로 다른 REMOTE_NAME을 쓰는 두 타겟이 같은
 라벨을 쓰는 경우에도 상태가 안 섞이게 하기 위함이다.
 
-## 상태 확인
-1) 설정 화면(settings.html 또는 config_schema 자동 폼 옆 상태 영역): get_status() 참고
+## 상태 확인 / 즉시 실행 (settings.html + settings.js)
+플러그인 설정 화면은 index.html이 아니라 settings.html/settings.js로
+렌더링된다 (index.html/style.css/script.js는 대시보드 카테고리 레벨
+전용). 코어에 "즉시 실행" 전용 백엔드 액션 엔드포인트가 없다는 게
+실제로 확인되어서 (cache_cleaner 플러그인 개발 과정에서 404 확인),
+같은 우회 패턴을 쓴다:
+
+    settings.js가 save-config 호출 시 config에 RUN_NOW_TOKEN(타임스탬프)을
+    슬쩍 끼워 저장 -> 이 플러그인이 5초 주기 전용 워치 잡으로 그 값이
+    바뀐 걸 감지하면 즉시 check_all_targets() 실행. 로그 지우기도
+    LOG_CLEAR_TOKEN으로 동일한 방식.
+
+상태는 get_dashboard_data()가 실제로 프론트에서 불리는 게 확인된
+엔드포인트(`/api/media/dashboard/widgets/{id}/data`)라서, get_status()의
+결과를 그대로 노출한다.
+
+1) 설정 화면(settings.html): get_dashboard_data() 참고
 2) 로그 파일: <STATE_DIR>/gd_poller4bookoasis.log
    각 줄에 "라벨:REMOTE_NAME:폴더ID(앞부분)" 형태로 표시되어, REMOTE_NAME이
    여러 개일 때도 어느 타겟인지 바로 구분 가능하다.
-
-수동으로 즉시 1회 확인하고 싶다면 handle_action(db_type, "check_now")를 호출하면 된다.
 """
 
 import os
@@ -73,11 +86,20 @@ from plugins.metadata.base import BaseMetadataProvider
 
 def run_gd_poller4bookoasis_job(db_type):
     """
-    APScheduler가 직접 호출하는 모듈 레벨 함수.
+    APScheduler가 직접 호출하는 모듈 레벨 함수 (메인 폴링 주기).
     인스턴스 상태에 의존하지 않도록 매번 새 provider를 만들어 쓴다.
     """
     provider = GdPoller4BookOasisProvider()
     provider.check_all_targets(db_type)
+
+
+def run_gd_poller4bookoasis_watch_job(db_type):
+    """
+    RUN_NOW_TOKEN / LOG_CLEAR_TOKEN 감지 전용, 5초 주기로 도는 가벼운 잡.
+    cache_cleaner와 동일한 "즉시 실행" 우회 패턴.
+    """
+    provider = GdPoller4BookOasisProvider()
+    provider._check_tokens(db_type)
 
 
 class GdPoller4BookOasisProvider(BaseMetadataProvider):
@@ -141,21 +163,26 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
     # ------------------------------------------------------------------
     def on_enable(self, db_type):
         self._register_job(db_type)
+        self._register_watch_job(db_type)
         self._ensure_watchdog(db_type)
         self._notify_startup(db_type)
 
     def on_disable(self, db_type):
         try:
             from services.scheduler_service import scheduler
-            job = scheduler.get_job(self._job_id(db_type))
-            if job:
-                scheduler.remove_job(self._job_id(db_type))
+            for jid in (self._job_id(db_type), self._watch_job_id(db_type)):
+                if scheduler.get_job(jid):
+                    scheduler.remove_job(jid)
         except Exception:
             pass
 
     @staticmethod
     def _job_id(db_type):
         return f"gd_poller4bookoasis_{db_type}"
+
+    @staticmethod
+    def _watch_job_id(db_type):
+        return f"gd_poller4bookoasis_watch_{db_type}"
 
     def _build_trigger(self, db_type):
         cfg = self.get_plugin_config(db_type, default={})
@@ -189,6 +216,28 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
             self._log_line(f"[전체] 스케줄러 등록 실패: {e}")
             return False
 
+    def _register_watch_job(self, db_type):
+        """RUN_NOW_TOKEN/LOG_CLEAR_TOKEN 감지용 5초 주기 잡 (메인 폴링과 별개)"""
+        try:
+            from services.scheduler_service import scheduler
+            from apscheduler.triggers.interval import IntervalTrigger
+        except Exception:
+            return False  # 코어 스케줄러가 없으면 폴백 스레드가 이미 메인 루프에서 대체 처리
+
+        try:
+            scheduler.add_job(
+                run_gd_poller4bookoasis_watch_job,
+                IntervalTrigger(seconds=5),
+                id=self._watch_job_id(db_type),
+                args=[db_type],
+                replace_existing=True,
+                max_instances=1,
+            )
+            return True
+        except Exception as e:
+            self._log_line(f"[전체] 워치 잡 등록 실패: {e}")
+            return False
+
     def _ensure_watchdog(self, db_type):
         with GdPoller4BookOasisProvider._scheduler_lock:
             existing = GdPoller4BookOasisProvider._watchdog_threads.get(db_type)
@@ -209,6 +258,8 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
                 from services.scheduler_service import scheduler
                 if not scheduler.get_job(self._job_id(db_type)):
                     self._register_job(db_type)
+                if not scheduler.get_job(self._watch_job_id(db_type)):
+                    self._register_watch_job(db_type)
             except Exception:
                 self._register_fallback_thread(db_type)
             time.sleep(300)
@@ -237,6 +288,9 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
             except (TypeError, ValueError):
                 interval_sec = 15
             self.check_all_targets(db_type)
+            # APScheduler가 없어 5초 워치 잡을 못 쓰는 환경이므로, 메인
+            # 루프 안에서라도 토큰을 확인한다 (반응 속도는 떨어짐).
+            self._check_tokens(db_type)
             time.sleep(max(5, interval_sec))
 
     # ------------------------------------------------------------------
@@ -348,6 +402,56 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         state["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         state["last_result"] = result
         self._write_state(state_key, state)
+
+    # ------------------------------------------------------------------
+    # RUN_NOW_TOKEN / LOG_CLEAR_TOKEN 처리 (settings.js의 "즉시 실행"
+    # 우회 패턴 - 자세한 설명은 파일 상단 docstring 참고)
+    # ------------------------------------------------------------------
+    def _tokens_state_path(self):
+        return os.path.join(self._plugin_dir(), "tokens_state.json")
+
+    def _read_tokens_state(self):
+        path = self._tokens_state_path()
+        if not os.path.isfile(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _write_tokens_state(self, tstate):
+        try:
+            with open(self._tokens_state_path(), "w", encoding="utf-8") as f:
+                json.dump(tstate, f, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def _check_tokens(self, db_type):
+        cfg = self.get_plugin_config(db_type, default={})
+        run_token = str(cfg.get("RUN_NOW_TOKEN") or "").strip()
+        log_clear_token = str(cfg.get("LOG_CLEAR_TOKEN") or "").strip()
+
+        tstate = self._read_tokens_state()
+        dirty = False
+
+        if run_token and run_token != tstate.get("last_run_now_token"):
+            self.check_all_targets(db_type)
+            tstate["last_run_now_token"] = run_token
+            tstate["last_run_now_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            dirty = True
+
+        if log_clear_token and log_clear_token != tstate.get("last_log_clear_token"):
+            try:
+                open(self._log_path(), "w", encoding="utf-8").close()
+            except OSError:
+                pass
+            tstate["last_log_clear_token"] = log_clear_token
+            tstate["last_log_clear_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            dirty = True
+
+        if dirty:
+            self._write_tokens_state(tstate)
 
     # ------------------------------------------------------------------
     # rclone RC API(config/dump)로 OAuth 토큰 읽기
@@ -779,6 +883,8 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
             from services.scheduler_service import scheduler
             if not scheduler.get_job(self._job_id(db_type)):
                 self._register_job(db_type)
+            if not scheduler.get_job(self._watch_job_id(db_type)):
+                self._register_watch_job(db_type)
         except Exception:
             self._register_fallback_thread(db_type)
         self._ensure_watchdog(db_type)
@@ -820,12 +926,21 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         except OSError:
             log_size_bytes = 0
 
+        tstate = self._read_tokens_state()
+
         return {
             "success": True,
             "targets": per_target,
             "next_run": next_run or "확인 불가 (폴백 스레드 모드)",
             "scheduler_backend": scheduler_backend,
             "log_size_bytes": log_size_bytes,
+            # settings.js가 RUN_NOW_TOKEN/LOG_CLEAR_TOKEN 처리 완료 여부를
+            # 폴링으로 확인할 때 쓰는 필드 (cache_cleaner의
+            # last_run_now_token 패턴과 동일)
+            "last_run_now_token": tstate.get("last_run_now_token"),
+            "last_run_now_at": tstate.get("last_run_now_at"),
+            "last_log_clear_token": tstate.get("last_log_clear_token"),
+            "last_log_clear_at": tstate.get("last_log_clear_at"),
         }
 
     def get_dashboard_data(self, db_type, limit=6):
@@ -833,21 +948,10 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         status["items"] = []
         return status
 
-    # ------------------------------------------------------------------
-    # 설정 화면의 "지금 즉시 확인" / "로그 지우기" 버튼이 호출할 액션
-    # (코어에 커스텀 액션 라우트가 있다는 전제 - cache_cleaner와 동일한 제약)
-    # ------------------------------------------------------------------
-    def handle_action(self, db_type, action, payload=None):
-        if action == "check_now":
-            results = self.check_all_targets(db_type)
-            return {"success": True, "results": results}
-        if action == "clear_log":
-            try:
-                open(self._log_path(), "w", encoding="utf-8").close()
-                return {"success": True}
-            except OSError as e:
-                return {"success": False, "error": f"로그 파일 삭제 실패: {e}"}
-        return {"success": False, "error": f"알 수 없는 action: {action}"}
+    # 참고: handle_action 같은 "즉시 실행 전용" 백엔드 액션 엔드포인트는
+    # 코어에 존재하지 않는다 (cache_cleaner 개발 과정에서 404로 확인됨).
+    # 즉시 실행/로그 지우기는 RUN_NOW_TOKEN/LOG_CLEAR_TOKEN 방식으로
+    # 처리한다 (_check_tokens 참고).
 
 
 # ------------------------------------------------------------------
@@ -869,6 +973,7 @@ def _auto_register():
     try:
         _provider = GdPoller4BookOasisProvider()
         _provider._register_job("general")
+        _provider._register_watch_job("general")
         _provider._ensure_watchdog("general")
     except Exception:
         pass
@@ -879,12 +984,15 @@ def _auto_register():
     # 식별자가 "adult"/"audiobook"이 아니라 core가 쓰는 다른 이름
     # (예: "media_adult")일 수도 있으므로, 이름을 짐작하지 않고
     # "gd_poller4bookoasis_"로 시작하는 잡 중 우리가 지금 쓰는
-    # general 잡이 아닌 건 전부 제거한다.
+    # general 메인/워치 잡이 아닌 건 전부 제거한다.
     try:
         from services.scheduler_service import scheduler
-        _keep_job_id = GdPoller4BookOasisProvider._job_id("general")
+        _keep_ids = {
+            GdPoller4BookOasisProvider._job_id("general"),
+            GdPoller4BookOasisProvider._watch_job_id("general"),
+        }
         for _job in list(scheduler.get_jobs()):
-            if _job.id.startswith("gd_poller4bookoasis_") and _job.id != _keep_job_id:
+            if _job.id.startswith("gd_poller4bookoasis_") and _job.id not in _keep_ids:
                 try:
                     scheduler.remove_job(_job.id)
                 except Exception:

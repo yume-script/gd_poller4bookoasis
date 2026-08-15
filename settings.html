@@ -1,0 +1,166 @@
+<style>
+  .gp-settings-panel { font-size: 14px; }
+  .gp-settings-title { font-weight: 700; font-size: 16px; margin-bottom: 4px; }
+  .gp-settings-desc { opacity: 0.75; margin-bottom: 12px; }
+  .gp-card { border: 1px solid rgba(128,128,128,0.25); border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; }
+  .gp-card-title { font-weight: 600; margin: 0 0 8px 0; }
+  .gp-hint { opacity: 0.7; font-size: 12.5px; margin: 4px 0 8px 0; }
+  .gp-settings-field { margin-bottom: 8px; }
+  .gp-settings-field label { display: block; font-weight: 600; margin-bottom: 4px; }
+  .gp-settings-field input { width: 100%; box-sizing: border-box; padding: 6px 8px; border-radius: 6px; border: 1px solid rgba(128,128,128,0.35); background: transparent; }
+  .gp-field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .gp-divider { height: 1px; background: rgba(128,128,128,0.25); margin: 10px 0; }
+  .gp-btn { padding: 7px 14px; border-radius: 6px; border: 1px solid rgba(128,128,128,0.35); cursor: pointer; font-weight: 600; }
+  .gp-btn-primary { background: #3b82f6; color: #fff; border-color: #3b82f6; }
+  .gp-btn-danger { background: #ef4444; color: #fff; border-color: #ef4444; }
+  .gp-btn-ghost { background: transparent; }
+  .gp-status-grid { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+  .gp-status-item { display: flex; justify-content: space-between; gap: 8px; padding: 3px 0; border-bottom: 1px dashed rgba(128,128,128,0.2); font-size: 13px; }
+  .gp-status-label { opacity: 0.7; }
+  .gp-status-warn .gp-status-value { color: #ef4444; font-weight: 600; }
+  .gp-status-loading { opacity: 0.6; font-size: 13px; }
+  .gp-run-result, .gp-save-result { margin-top: 6px; font-size: 13px; min-height: 16px; }
+  .gp-result-ok { color: #22c55e; }
+  .gp-result-error { color: #ef4444; }
+</style>
+<div class="gp-settings-panel">
+  <div class="gp-settings-title">gd_poller4bookoasis 설정</div>
+  <div class="gp-settings-desc">
+    구글 드라이브 폴더(하위 포함) 변경을 감시하다가 변경이 감지되면
+    rclone VFS 캐시를 refresh하고, 설정 시 디스코드로 알립니다.
+  </div>
+
+  <details class="gp-settings-section" open>
+    <summary>설정 펼치기 (클릭)</summary>
+    <div class="gp-settings-body">
+
+      <!-- 상태 -->
+      <section class="gp-card">
+        <h3 class="gp-card-title">📊 상태</h3>
+        <div id="gp-status" class="gp-status-grid">
+          <div class="gp-status-loading">불러오는 중...</div>
+        </div>
+        <button id="gp-refresh-btn" class="gp-btn gp-btn-ghost">새로고침</button>
+      </section>
+
+      <!-- 즉시 실행 / 로그 -->
+      <section class="gp-card">
+        <h3 class="gp-card-title">🧹 즉시 실행</h3>
+        <p class="gp-hint">
+          다음 폴링을 기다리지 않고 지금 바로 모든 감시 대상을 확인합니다.
+        </p>
+        <button id="gp-run-now-btn" class="gp-btn gp-btn-primary">▶ 지금 즉시 확인</button>
+        <div id="gp-run-now-result" class="gp-run-result"></div>
+
+        <div class="gp-divider"></div>
+
+        <p class="gp-hint">로그 파일 내용을 비웁니다 (파일 자체는 유지).</p>
+        <button id="gp-clear-log-btn" class="gp-btn gp-btn-danger">🗑 로그 지우기</button>
+        <div id="gp-clear-log-result" class="gp-run-result"></div>
+      </section>
+
+      <!-- 감시 대상 -->
+      <section class="gp-card">
+        <h3 class="gp-card-title">📁 감시 대상 (최대 5개)</h3>
+        <p class="gp-hint">형식: 라벨:REMOTE_NAME:구글드라이브폴더ID (안 쓰는 칸은 비워두세요)</p>
+
+        <div class="gp-settings-field">
+          <label for="gp-target-1">감시 대상 1 <em>*</em></label>
+          <div class="gp-input-container">
+            <input id="gp-target-1" type="text" name="WATCH_TARGET_1" placeholder="general:gdrive:1AbCd..." />
+          </div>
+        </div>
+        <div class="gp-settings-field">
+          <label for="gp-target-2">감시 대상 2</label>
+          <div class="gp-input-container">
+            <input id="gp-target-2" type="text" name="WATCH_TARGET_2" placeholder="" />
+          </div>
+        </div>
+        <div class="gp-settings-field">
+          <label for="gp-target-3">감시 대상 3</label>
+          <div class="gp-input-container">
+            <input id="gp-target-3" type="text" name="WATCH_TARGET_3" placeholder="" />
+          </div>
+        </div>
+        <div class="gp-settings-field">
+          <label for="gp-target-4">감시 대상 4</label>
+          <div class="gp-input-container">
+            <input id="gp-target-4" type="text" name="WATCH_TARGET_4" placeholder="" />
+          </div>
+        </div>
+        <div class="gp-settings-field">
+          <label for="gp-target-5">감시 대상 5</label>
+          <div class="gp-input-container">
+            <input id="gp-target-5" type="text" name="WATCH_TARGET_5" placeholder="" />
+          </div>
+        </div>
+      </section>
+
+      <!-- rclone / 알림 -->
+      <section class="gp-card">
+        <h3 class="gp-card-title">⚙️ rclone / 알림</h3>
+
+        <div class="gp-settings-field">
+          <label for="gp-rc-addr">rclone RC 주소 <em>*</em></label>
+          <div class="gp-input-container">
+            <input id="gp-rc-addr" type="text" name="RC_ADDR" placeholder="http://localhost:5572" />
+          </div>
+        </div>
+
+        <div class="gp-field-grid">
+          <div class="gp-settings-field">
+            <label for="gp-rc-user">rclone RC 사용자</label>
+            <div class="gp-input-container">
+              <input id="gp-rc-user" type="text" name="RC_USER" placeholder="" />
+            </div>
+          </div>
+          <div class="gp-settings-field">
+            <label for="gp-rc-pass">rclone RC 비밀번호</label>
+            <div class="gp-input-container">
+              <input id="gp-rc-pass" type="password" name="RC_PASS" placeholder="" />
+            </div>
+          </div>
+        </div>
+
+        <div class="gp-settings-field">
+          <label for="gp-rc-fs">refresh 대상 fs (union 등 실제 마운트 이름)</label>
+          <div class="gp-input-container">
+            <input id="gp-rc-fs" type="text" name="RC_FS" placeholder="예: myunion:" />
+            <p class="hint">여러 mount가 떠 있거나 union으로 묶여 있으면 실제 마운트에 쓴 이름을 넣으세요.</p>
+          </div>
+        </div>
+
+        <div class="gp-settings-field">
+          <label for="gp-discord">디스코드 웹훅 URL</label>
+          <div class="gp-input-container">
+            <input id="gp-discord" type="password" name="DISCORD_WEBHOOK_URL" placeholder="비우면 알림 없음" />
+          </div>
+        </div>
+      </section>
+
+      <!-- 실행 주기 -->
+      <section class="gp-card">
+        <h3 class="gp-card-title">⏱ 실행 주기</h3>
+
+        <div class="gp-field-grid">
+          <div class="gp-settings-field">
+            <label for="gp-interval">폴링 주기 (초)</label>
+            <div class="gp-input-container">
+              <input id="gp-interval" type="text" name="POLL_INTERVAL_SECONDS" placeholder="15" />
+            </div>
+          </div>
+          <div class="gp-settings-field">
+            <label for="gp-heartbeat">하트비트 알림 주기 (N번마다, 0=끔)</label>
+            <div class="gp-input-container">
+              <input id="gp-heartbeat" type="text" name="HEARTBEAT_EVERY_N_RUNS" placeholder="0" />
+            </div>
+          </div>
+        </div>
+
+        <button id="gp-save-btn" class="gp-btn gp-btn-primary">💾 설정 저장</button>
+        <div id="gp-save-result" class="gp-save-result"></div>
+      </section>
+
+    </div>
+  </details>
+</div>
