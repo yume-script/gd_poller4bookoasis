@@ -150,16 +150,37 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
     update_manifest = {
         "enabled": True,
         "provider": "github-raw",
-        "raw_base_url": "https://raw.githubusercontent.com/<org>/<repo>/<branch>/plugins/metadata/gd_poller4bookoasis",
-        "files": ["gd_poller4bookoasis.py", "__init__.py", "VERSION"],
+        "raw_base_url": "https://raw.githubusercontent.com/yume-script/gd_poller4bookoasis/refs/heads/main/",
+        "files": [
+            "gd_poller4bookoasis.py",
+            "__init__.py",
+            "VERSION",
+            "index.html",
+            "style.css",
+            "script.js",
+            "settings.html",
+            "settings.js",
+        ],
         "version_file": "VERSION",
         "version_key": "plugin version",
         "show_sample_update_button": True,
     }
 
     # 대시보드 카드 렌더러가 "도서 카드" 틀에 고정돼 있어 안 맞으므로
-    # 대시보드에는 노출하지 않는다. 상태 확인은 설정 화면에서 처리.
+    # 대시보드(플러그인 데스크 탭)에는 노출하지 않는다.
     dashboard_widget = None
+
+    # 좌측 사이드바에 독립 카테고리 메뉴로 등록 (scan_scheduler, jikji_sf와
+    # 동일한 방식). 이 계약이 있어야 index.html/style.css/script.js가 실제로
+    # 로드되어 커스텀 풀페이지가 렌더링된다. 상태 확인 + 전체 설정 폼을
+    # 여기(풀페이지)로 옮기고, settings.html(환경설정 탭 모달)은 짧은
+    # 안내문만 남긴다 (모달 폭이 좁아 항목이 많으면 잘려 보이는 문제 때문).
+    category_tab = {
+        "title": "구글드라이브 감시",
+        "icon": "fa-solid fa-cloud-arrow-down",
+        "order": 96,
+        "sessions": "all",
+    }
 
     _watchdog_threads = {}
     _scheduler_lock = threading.Lock()
@@ -1053,6 +1074,22 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
     # ------------------------------------------------------------------
     # 상태 데이터 (설정 화면 JS가 소비)
     # ------------------------------------------------------------------
+    def _config_with_defaults(self, cfg):
+        """config_schema 기본값으로 채운 현재 설정값.
+
+        index.html(풀페이지)이 별도의 "설정 조회" 엔드포인트 없이도 이미
+        쓰고 있는 대시보드 데이터 엔드포인트만으로 입력 필드를 채울 수
+        있도록 get_status() 응답에 포함시킨다 (기존 settings.html/js는
+        host가 모달을 열 때 name 속성 기준으로 값을 미리 채워줬지만,
+        풀페이지는 그 자동 채움 대상이 아니라서 직접 넣어줘야 한다).
+        """
+        cfg = cfg or {}
+        result = {}
+        for field in self.config_schema:
+            key = field["key"]
+            result[key] = cfg.get(key, field.get("default", ""))
+        return result
+
     def get_status(self, db_type):
         try:
             from services.scheduler_service import scheduler
@@ -1105,6 +1142,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
 
         return {
             "success": True,
+            "config": self._config_with_defaults(cfg),
             "targets": per_target,
             "next_run": next_run or "확인 불가 (폴백 스레드 모드)",
             "scheduler_backend": scheduler_backend,
