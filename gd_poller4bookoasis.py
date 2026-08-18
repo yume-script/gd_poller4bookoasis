@@ -44,14 +44,45 @@ WATCH_TARGET_5에 하나씩 나눠 적는다 (최대 5개, 안 쓰는 건 비워
 무관하다 (rclone VFS refresh 자체가 라이브러리 스코프와 무관한 공용
 동작이기 때문).
 
-## 첫 인덱싱 / Changes API page_token 영속화
-구글 드라이브 폴더 하위 트리 전체를 매번 다시 훑으면 비효율적이므로,
-타겟별로 최초 1회만 전체 인덱싱(folder_ids, item_ids)하고 이후에는
-Drive Changes API의 page_token만 이어서 사용한다. 이 상태는 타겟별
-상태 파일(state_<remote_name>_<폴더ID>.json)에 저장해 프로세스/서버
-재시작에도 이어진다. 상태 파일 키를 라벨이 아니라 remote_name+폴더ID
-조합으로 잡는 이유는, 서로 다른 REMOTE_NAME을 쓰는 두 타겟이 같은
-라벨을 쓰는 경우에도 상태가 안 섞이게 하기 위함이다.
+## 변경 감지 방식: Drive Activity API v2 (halfaider/gd-poller 참고, 2024-xx 전환)
+원래는 Drive Changes API(changes().list + page_token)로 변경을 감지하고,
+타겟 폴더 하위 트리 전체를 직접 인덱싱(folder_ids/item_ids/item_meta)해서
+그 안에서 일어난 변경인지 직접 판정했었다. halfaider/gd-poller
+(gd_poller/pollers.py의 ActivityPoller, apis.py의 get_full_path 등)를
+참고해서 Drive Activity API(driveactivity v2, activity().query)로
+전환했다.
+
+Changes API 방식과 비교했을 때:
+  - 장점: activity().query(ancestorName=f"items/{folder_id}")로 폴더
+    범위를 API 레벨에서 직접 지정할 수 있어서, 하위 트리 전체를 미리
+    인덱싱해둘 필요가 없다 (folder_ids/item_ids/item_meta 전부 불필요).
+    또한 create/edit/move/rename/delete/restore 같은 "액션 종류"를
+    Changes API보다 훨씬 명확하게 구분해서 준다.
+  - 단점: page_token처럼 서버가 이어서 알려주는 커서가 없어서, 타겟별로
+    "마지막으로 조회한 시각(last_poll_time)"을 직접 상태 파일에
+    저장해두고 시간 구간(time > start AND time <= end)으로 질의해야
+    한다. 또한 항목의 전체 경로(폴더/하위폴더/파일명)를 Activity API
+    응답이 주지 않으므로, 변경된 항목마다 Drive files.get으로 부모를
+    거슬러 올라가며 조립해야 한다 (halfaider/gd-poller의 get_full_path와
+    동일한 방식을 동기 버전으로 단순화해서 사용 - _activity_resolve_path).
+  - 주의: Activity API는 rclone이 기본으로 요청하는 "drive" 스코프와는
+    별개로 "drive.activity.readonly" 동의가 필요하다. rclone remote가
+    이 스코프로 인증돼 있지 않으면 403(insufficient scopes)이 날 수
+    있다 - 이 플러그인 코드로 해결할 수 있는 부분이 아니라 rclone
+    쪽 재인증이 필요하다.
+
+## 첫 실행 / 폴링 기준 시각(last_poll_time) 영속화
+타겟별로 최초 1회는 폴더 트리를 훑는 대신, "지금부터 감시 시작"이라는
+의미로 기준 시각(last_poll_time)만 상태 파일에 저장한다. 이후에는
+매 폴링마다 [last_poll_time, now - ACTIVITY_POLL_DELAY_SECONDS] 구간을
+Activity API에 질의하고, 성공하면 그 구간의 끝 시각으로 last_poll_time을
+갱신한다. Activity API 응답이 서버에 즉시 반영되지 않고 약간 지연될 수
+있어서 지금 시각을 그대로 쓰지 않고 ACTIVITY_POLL_DELAY_SECONDS만큼
+여유를 둔다 (halfaider/gd-poller의 polling_delay와 동일한 목적).
+이 상태는 타겟별 상태 파일(state_<remote_name>_<폴더ID>.json)에
+저장해 프로세스/서버 재시작에도 이어진다. 상태 파일 키를 라벨이 아니라
+remote_name+폴더ID 조합으로 잡는 이유는, 서로 다른 REMOTE_NAME을 쓰는
+두 타겟이 같은 라벨을 쓰는 경우에도 상태가 안 섞이게 하기 위함이다.
 
 ## 상태 확인 / 즉시 실행 (settings.html + settings.js)
 플러그인 설정 화면은 index.html이 아니라 settings.html/settings.js로
@@ -128,6 +159,12 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
          "type": "password", "required": False, "default": ""},
         {"key": "POLL_INTERVAL_SECONDS", "label": "폴링 주기 (초)",
          "type": "text", "required": False, "default": "15"},
+        {"key": "ACTIVITY_POLL_DELAY_SECONDS",
+         "label": "Activity API 반영 지연 여유 (초, halfaider/gd-poller의 polling_delay와 동일 목적)",
+         "type": "text", "required": False, "default": "60"},
+        {"key": "ACTIVITY_ACTIONS",
+         "label": "감시할 액션 (쉼표 구분, 비우면 기본값 전부: create,edit,move,rename,delete,restore)",
+         "type": "text", "required": False, "default": ""},
         {"key": "HEARTBEAT_EVERY_N_RUNS", "label": "하트비트 알림 주기 (N번 폴링마다 1번, 0=끔)",
          "type": "text", "required": False, "default": "0"},
         {"key": "WEBHOOK_BASE_URL", "label": "BookOasis 주소 (예: http://localhost:5930)",
@@ -422,6 +459,15 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
 
     def _log_line(self, text):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] [gd_poller4bookoasis] {text}"
+        # 파일 로그(<STATE_DIR>/gd_poller4bookoasis.log)와 별개로, 도커
+        # 컨테이너 로그(docker logs)에서도 바로 확인할 수 있도록 콘솔에도
+        # 동일하게 출력한다. flush=True로 즉시 내보내야 버퍼링 때문에
+        # 컨테이너 로그에 지연 없이 찍힌다.
+        try:
+            print(line, flush=True)
+        except Exception:
+            pass
         try:
             with open(self._log_path(), "a", encoding="utf-8") as f:
                 f.write(f"[{ts}] {text}\n")
@@ -543,87 +589,105 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
             token_uri="https://oauth2.googleapis.com/token",
             client_id=client_id,
             client_secret=client_secret,
-            scopes=["https://www.googleapis.com/auth/drive"],
+            # drive: 경로 조립용 files.get 호출에 필요
+            # drive.activity.readonly: Activity API 질의에 필요
+            # 주의: 여기 적는 scopes는 클라이언트 라이브러리에 "이 정도는
+            # 필요하다"고 알려주는 값일 뿐, 실제 권한은 rclone이 최초
+            # 인증할 때 사용자가 동의한 스코프로 이미 고정돼 있다.
+            # rclone remote가 drive.activity.readonly로 동의된 적이
+            # 없다면 Activity API 호출은 403(insufficient scopes)이 날
+            # 수 있다 - 그 경우 rclone 쪽 재인증이 필요하다.
+            scopes=[
+                "https://www.googleapis.com/auth/drive",
+                "https://www.googleapis.com/auth/drive.activity.readonly",
+            ],
         )
 
-    def _collect_subtree_ids(self, drive, root_folder_id):
+    # ------------------------------------------------------------------
+    # Drive Activity API v2 헬퍼 (halfaider/gd-poller의
+    # ActivityPoller.get_action_info / get_target_info / apis.get_full_path를
+    # 동기 버전으로 단순화해서 이식)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _activity_action_info(action_detail):
         """
-        하위 트리 전체를 순회하며 폴더/전체 항목 ID뿐 아니라, 각 항목의
-        이름과 직속 부모 ID(item_meta)도 함께 수집한다. 이걸 저장해두면
-        나중에 변경 감지 시 "전체 경로(폴더/파일명)"를 추가 API 호출
-        없이 로컬에서 조립할 수 있다.
-
-        구글드라이브 "바로가기(shortcut)"는 mimeType이 폴더가 아니라
-        application/vnd.google-apps.shortcut이라서, 그냥 두면 그 안쪽을
-        전혀 순회하지 못하고 실제 대상 폴더의 ID도 감시 목록에 안 들어간다
-        (Drive Changes API는 바로가기가 아니라 실제 파일의 진짜 위치
-        ID로 변경을 알려주기 때문에, 그 ID를 모르면 변경이 조용히
-        무시된다). 그래서 바로가기를 만나면 shortcutDetails로 실제
-        대상(target)을 확인해서, 대상이 폴더면 그 실제 ID까지 따라
-        들어가서 계속 순회한다.
+        activity["primaryActionDetail"] 딕셔너리에서 (action, action_detail)을
+        뽑아낸다. action은 "create"/"edit"/"move"/"rename"/"delete"/
+        "restore"/"permissionChange" 등 Activity API가 주는 키 이름 그대로.
+        action_detail은 action 종류에 따라 부가 정보(예: rename이면 이전
+        제목, delete/restore면 TRASH/PERMANENT_DELETE 등)를 담는다.
         """
-        folder_ids = {root_folder_id}
-        all_item_ids = {root_folder_id}
-        item_meta = {}  # id -> {"name": str, "parent": parent_id or None, "is_folder": bool}
-        queue = [root_folder_id]
-        while queue:
-            parent_id = queue.pop(0)
-            page_token = None
-            while True:
-                resp = drive.files().list(
-                    q=f"'{parent_id}' in parents and trashed=false",
-                    fields="nextPageToken,files(id,name,mimeType,shortcutDetails)",
-                    pageSize=1000,
-                    pageToken=page_token,
-                ).execute()
-                for f in resp.get("files", []):
-                    fid = f["id"]
-                    mime = f.get("mimeType")
-                    name = f.get("name", fid)
+        for key in action_detail:
+            detail = action_detail[key] or {}
+            if key == "move":
+                removed_parents = detail.get("removedParents") or [{}]
+                action_extra = GdPoller4BookOasisProvider._activity_target_info(removed_parents[0])
+            elif key == "rename":
+                action_extra = detail.get("oldTitle")
+            elif key in ("delete", "restore"):
+                action_extra = detail.get("type")
+            elif key == "permissionChange":
+                action_extra = detail.get("addedPermissions")
+            else:
+                action_extra = None
+            return key, action_extra
+        return "unknown", None
 
-                    if mime == "application/vnd.google-apps.shortcut":
-                        shortcut = f.get("shortcutDetails") or {}
-                        target_id = shortcut.get("targetId")
-                        target_mime = shortcut.get("targetMimeType")
-                        if target_id and target_mime == "application/vnd.google-apps.folder":
-                            # 바로가기가 가리키는 실제 폴더 ID로 등록하고 그 안까지 순회
-                            if target_id not in folder_ids:
-                                all_item_ids.add(target_id)
-                                item_meta[target_id] = {"name": name, "parent": parent_id, "is_folder": True}
-                                folder_ids.add(target_id)
-                                queue.append(target_id)
-                            continue
-                        # 폴더가 아닌 대상(파일)에 대한 바로가기는 그냥 일반 항목으로만 기록
-                        all_item_ids.add(fid)
-                        item_meta[fid] = {"name": name, "parent": parent_id, "is_folder": False}
-                        continue
+    @staticmethod
+    def _activity_target_info(target):
+        """
+        activity["targets"][i] (또는 removedParents[0]) 하나에서
+        (title, item_id, mimeType)을 뽑아낸다. driveItem/drive 형태가
+        아니면 item_id가 빈 문자열로 온다 (호출부에서 스킵 처리).
+        """
+        info = target.get("driveItem") or target.get("drive")
+        if not info:
+            return "unknown", "", ""
+        title = info.get("title") or "unknown"
+        # name은 "items/<id>" 형태로 오므로 마지막 조각만 취한다
+        item_id = (info.get("name") or "").rpartition("/")[-1]
+        mime = info.get("mimeType") or ""
+        return title, item_id, mime
 
-                    is_folder = mime == "application/vnd.google-apps.folder"
-                    all_item_ids.add(fid)
-                    item_meta[fid] = {"name": name, "parent": parent_id, "is_folder": is_folder}
-                    if is_folder:
-                        folder_ids.add(fid)
-                        queue.append(fid)
-                page_token = resp.get("nextPageToken")
-                if not page_token:
-                    break
-        return folder_ids, all_item_ids, item_meta
+    @staticmethod
+    def _activity_watch_actions(cfg):
+        """ACTIVITY_ACTIONS 설정값을 파싱. 비어있으면 기본 액션 전체."""
+        default_actions = {"create", "edit", "move", "rename", "delete", "restore"}
+        raw = (cfg.get("ACTIVITY_ACTIONS") or "").strip()
+        if not raw:
+            return default_actions
+        return {a.strip() for a in raw.split(",") if a.strip()}
 
-    def _resolve_full_path(self, name, parent_id, item_meta, root_folder_id):
-        """item_meta 체인을 거슬러 올라가며 '상위폴더/하위폴더/파일명' 형태 경로를 조립"""
+    def _activity_resolve_path(self, drive, item_id, ancestor_id, max_depth=100):
+        """
+        item_id부터 ancestor_id(감시 루트 폴더)까지 files.get으로 부모를
+        거슬러 올라가며 "상위폴더/하위폴더/파일명" 형태 경로를 조립한다.
+        halfaider/gd-poller의 apis.GoogleDrive.get_full_path를 동기 버전
+        으로 단순화한 것 - 트리를 미리 인덱싱해두지 않으므로 매 변경
+        이벤트마다 API를 호출한다 (그 대신 폴더 전체를 훑을 필요는
+        없어짐). 대상이 이미 영구 삭제되었거나 권한이 없어 조회가
+        실패하면 None을 돌려주고, 호출부는 title 등으로 대체한다.
+        """
         parts = []
-        seen = set()
-        cur = parent_id
-        while cur and cur != root_folder_id and cur not in seen:
-            seen.add(cur)
-            meta = item_meta.get(cur)
-            if not meta:
-                break
-            parts.append(meta["name"])
-            cur = meta.get("parent")
-        parts.reverse()
-        parts.append(name)
-        return "/".join(parts)
+        current_id = item_id
+        depth = 0
+        try:
+            while current_id and depth < max_depth:
+                depth += 1
+                if current_id == ancestor_id:
+                    break
+                file = drive.files().get(
+                    fileId=current_id,
+                    fields="id,name,parents",
+                    supportsAllDrives=True,
+                ).execute()
+                parts.append(file.get("name") or current_id)
+                parents = file.get("parents") or []
+                current_id = parents[0] if parents else None
+            parts.reverse()
+            return "/".join(parts) if parts else None
+        except Exception:
+            return None
 
     def _call_rclone_rc_refresh(self, db_type):
         import requests
@@ -850,6 +914,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
     # 핵심 로직 — 타겟 1개 점검
     # ------------------------------------------------------------------
     def check_target(self, db_type, target):
+        import datetime
         from googleapiclient.discovery import build
 
         if target.get("parse_error"):
@@ -862,151 +927,124 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
 
         creds = self._load_credentials(db_type, remote_name)
         drive = build("drive", "v3", credentials=creds)
+        activity = build("driveactivity", "v2", credentials=creds)
+
+        cfg = self.get_plugin_config(db_type, default={})
+        try:
+            poll_delay_sec = int(cfg.get("ACTIVITY_POLL_DELAY_SECONDS") or 60)
+        except (TypeError, ValueError):
+            poll_delay_sec = 60
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        end_time = now - datetime.timedelta(seconds=max(0, poll_delay_sec))
 
         state = self._read_state(state_key) or {}
 
-        # 최초 실행 시에만 하위 트리 전체 인덱싱
-        if "folder_ids" not in state or state.get("indexed_folder_id") != folder_id:
-            folder_ids, item_ids, item_meta = self._collect_subtree_ids(drive, folder_id)
-            page_token = drive.changes().getStartPageToken().execute()["startPageToken"]
+        # 최초 실행 시에는 트리를 훑지 않고 "지금부터 감시 시작" 기준
+        # 시각만 기록한다 (Activity API는 ancestorName으로 범위를 API
+        # 레벨에서 잡아주므로 사전 인덱싱이 필요 없다).
+        if "last_poll_time" not in state or state.get("indexed_folder_id") != folder_id:
             state = {
                 "indexed_folder_id": folder_id,
-                "folder_ids": list(folder_ids),
-                "item_ids": list(item_ids),
-                "item_meta": item_meta,
-                "page_token": page_token,
+                "last_poll_time": end_time.isoformat(),
             }
             self._write_state(state_key, state)
             return {"mode": "indexed", "changes_found": 0,
-                    "note": f"초기 인덱싱 완료: 폴더 {len(folder_ids)}개, 항목 {len(item_ids)}개"}
+                    "note": "Drive Activity API 감시 시작 (초기 기준 시각 설정 완료)"}
 
-        folder_ids = set(state["folder_ids"])
-        item_ids = set(state["item_ids"])
-        item_meta = state.get("item_meta", {})
-        page_token = state["page_token"]
+        try:
+            start_time = datetime.datetime.fromisoformat(state["last_poll_time"])
+        except (TypeError, ValueError):
+            start_time = end_time
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=datetime.timezone.utc)
 
-        # ------------------------------------------------------------
-        # 1단계: 이번 폴링에서 온 변경 이벤트를 전부 모으기만 한다.
-        # (바로바로 판정하지 않는 이유는 아래 2단계 설명 참고)
-        # ------------------------------------------------------------
-        raw_changes = []
-        request = drive.changes().list(
-            pageToken=page_token,
-            spaces="drive",
-            fields="nextPageToken,newStartPageToken,"
-                   "changes(fileId,removed,file(name,parents,mimeType,shortcutDetails))",
-        )
-        while request is not None:
-            response = request.execute()
-            raw_changes.extend(response.get("changes", []))
-            if "newStartPageToken" in response:
-                page_token = response["newStartPageToken"]
-            request = drive.changes().list_next(request, response)
+        if start_time >= end_time:
+            # ACTIVITY_POLL_DELAY_SECONDS가 폴링 주기보다 길면 아직 조회할
+            # 새 구간이 없을 수 있다. 상태는 그대로 두고 다음 틱을 기다린다.
+            return {"mode": "ok", "changes_found": 0, "changes": [], "changed_paths": []}
+
+        watch_actions = self._activity_watch_actions(cfg)
 
         # ------------------------------------------------------------
-        # 2단계: 폴더 생성 이벤트부터 folder_ids/item_meta에 반영 (fixed-point).
+        # 1단계: [start_time, end_time] 구간의 활동을 전부 모은다.
+        # halfaider/gd-poller의 ActivityPoller._poll과 동일한 필터 형식
+        # (time > ... AND time <= ...)을 사용하되, 여기서는 동기적으로
+        # 한 타겟씩 페이지네이션까지 다 끝낸 뒤 다음 타겟으로 넘어간다.
+        # ------------------------------------------------------------
+        raw_activities = []
+        page_token = None
+        while True:
+            body = {
+                "pageSize": 100,
+                "ancestorName": f"items/{folder_id}",
+                "filter": (
+                    f"time > {int(start_time.timestamp() * 1000)} "
+                    f"AND time <= {int(end_time.timestamp() * 1000)}"
+                ),
+            }
+            if page_token:
+                body["pageToken"] = page_token
+            response = activity.activity().query(body=body).execute()
+            raw_activities.extend(response.get("activities", []))
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+
+        # ------------------------------------------------------------
+        # 2단계: 액션/대상 파싱 + 경로 조립 + 최종 판정
         #
-        # Drive Changes API는 이벤트 순서를 "부모 폴더가 먼저"로 보장하지
-        # 않는다. 깊은 하위 폴더 구조를 한 번에 업로드하면(예: 5단계
-        # 중첩), 손자 폴더의 파일 변경 이벤트가 그 부모 폴더의 생성
-        # 이벤트보다 먼저 올 수도 있다. 한 번에 다 모아놓고, 새로 생긴
-        # 폴더들을 (더 이상 새로 편입되는 폴더가 없을 때까지) 반복
-        # 반영한 뒤에 파일 변경을 판정해야 깊은 곳의 변경을 놓치지 않는다.
-        # item_meta도 같이 채워야 나중에 전체 경로를 조립할 수 있다.
-        #
-        # 바로가기(shortcut)도 여기서 같이 처리한다: 새로 생긴 바로가기가
-        # 폴더를 가리키면, 그 바로가기 자체의 ID가 아니라 실제 대상
-        # 폴더의 ID를 folder_ids에 등록해야 한다 (자세한 이유는 초기
-        # 인덱싱 함수 _collect_subtree_ids의 docstring 참고).
-        # ------------------------------------------------------------
-        changed = True
-        while changed:
-            changed = False
-            for ch in raw_changes:
-                if ch.get("removed"):
-                    continue
-                file_info = ch.get("file") or {}
-                mime = file_info.get("mimeType")
-                parents = file_info.get("parents", [])
-                file_id = ch["fileId"]
-
-                if mime == "application/vnd.google-apps.folder":
-                    if file_id in folder_ids:
-                        continue
-                    if any(p in folder_ids for p in parents):
-                        folder_ids.add(file_id)
-                        item_meta[file_id] = {
-                            "name": file_info.get("name", file_id),
-                            "parent": parents[0] if parents else None,
-                            "is_folder": True,
-                        }
-                        changed = True
-                    continue
-
-                if mime == "application/vnd.google-apps.shortcut":
-                    # 바로가기가 폴더를 가리키면, 그 실제 대상 폴더 ID를
-                    # folder_ids에 등록해야 그 안의 변경도 잡을 수 있다
-                    # (§ 하단 3단계 주석 참고: Changes API는 대상의 진짜
-                    # ID로 변경을 알려주기 때문).
-                    shortcut = file_info.get("shortcutDetails") or {}
-                    target_id = shortcut.get("targetId")
-                    target_mime = shortcut.get("targetMimeType")
-                    if (target_id and target_mime == "application/vnd.google-apps.folder"
-                            and target_id not in folder_ids
-                            and any(p in folder_ids for p in parents)):
-                        folder_ids.add(target_id)
-                        item_meta[target_id] = {
-                            "name": file_info.get("name", target_id),
-                            "parent": parents[0] if parents else None,
-                            "is_folder": True,
-                        }
-                        changed = True
-                    continue
-
-        # ------------------------------------------------------------
-        # 3단계: 완성된 folder_ids/item_meta 기준으로 최종 판정 + 전체 경로 조립
+        # Activity API는 Changes API와 달리 "이 액티비티가 어느 폴더
+        # 하위에서 일어났는지"를 ancestorName 질의 자체가 보장해주므로,
+        # 폴더 트리를 미리 인덱싱해둘 필요가 없다. 그 대신 응답이 전체
+        # 경로를 안 주기 때문에, 대상 하나마다 _activity_resolve_path로
+        # Drive files.get을 거슬러 올라가며 조립해야 한다 (건수가 많지
+        # 않은 변경 감지 용도라 매 이벤트 API 호출 비용은 감수한다).
         # ------------------------------------------------------------
         change_lines = []
-        changed_paths = []  # 가공용 원본 데이터: [{"path": ..., "removed": bool}, ...]
-        for ch in raw_changes:
-            file_id = ch["fileId"]
-            removed = ch.get("removed", False)
-            file_info = ch.get("file") or {}
-            parents = file_info.get("parents", [])
+        changed_paths = []  # 가공용 원본 데이터: [{"path": ..., "removed": bool, "action": ...}, ...]
+        seen = set()  # (item_id, action) 중복 제거 - 한 구간에 같은 대상이 여러 번 찍힐 수 있음
+        icons = {
+            "create": "➕", "edit": "✏️", "move": "🚚", "rename": "📝",
+            "delete": "🗑️", "restore": "♻️", "permissionChange": "🔑",
+        }
 
-            if removed:
-                if file_id in item_ids:
-                    item_ids.discard(file_id)
-                    folder_ids.discard(file_id)
-                    cached = item_meta.pop(file_id, None)
-                    if cached:
-                        full_path = self._resolve_full_path(
-                            cached["name"], cached.get("parent"), item_meta, folder_id
-                        )
-                    else:
-                        full_path = file_id  # 캐시에도 없으면 ID로 대체
-                    change_lines.append(f"🗑️ 삭제: {full_path}")
-                    changed_paths.append({"path": full_path, "removed": True})
+        for act in raw_activities:
+            primary = act.get("primaryActionDetail") or {}
+            if not primary:
+                continue
+            action, action_extra = self._activity_action_info(primary)
+            if watch_actions and action not in watch_actions:
                 continue
 
-            if any(p in folder_ids for p in parents):
-                item_ids.add(file_id)
-                name = file_info.get("name", file_id)
-                parent_id = parents[0] if parents else None
-                item_meta[file_id] = {
-                    "name": name,
-                    "parent": parent_id,
-                    "is_folder": file_info.get("mimeType") == "application/vnd.google-apps.folder",
-                }
-                full_path = self._resolve_full_path(name, parent_id, item_meta, folder_id)
-                change_lines.append(f"✏️ 변경: {full_path}")
-                changed_paths.append({"path": full_path, "removed": False})
+            targets = act.get("targets") or []
+            title, item_id, mime = ("unknown", "", "")
+            for t in targets:
+                title, item_id, mime = self._activity_target_info(t)
+                if item_id:
+                    break
+            if not item_id:
+                continue
 
-        # 상태 갱신 (인덱스 정보는 유지, page_token/집합/메타 업데이트)
-        state["folder_ids"] = list(folder_ids)
-        state["item_ids"] = list(item_ids)
-        state["item_meta"] = item_meta
-        state["page_token"] = page_token
+            dedup_key = (item_id, action)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+
+            if action == "delete" and action_extra != "TRASH":
+                # 영구 삭제된 대상은 files.get으로 더 이상 조회가 안 되므로
+                # 전체 경로 대신 활동 로그에 남은 제목만 사용한다.
+                full_path = title
+            else:
+                full_path = self._activity_resolve_path(drive, item_id, folder_id) or title
+
+            removed = action == "delete"
+            icon = icons.get(action, "🔔")
+            change_lines.append(f"{icon} {action}: {full_path}")
+            changed_paths.append({"path": full_path, "removed": removed, "action": action})
+
+        # 상태 갱신: 다음 폴링은 이번에 조회한 구간의 끝 시각부터 이어간다.
+        state["last_poll_time"] = end_time.isoformat()
         run_count = int(state.get("run_count", 0)) + 1
         state["run_count"] = run_count
         self._write_state(state_key, state)
@@ -1016,7 +1054,6 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
             self._notify_discord(db_type, display_label, change_lines)
             self._notify_bookoasis_scan(db_type, changed_paths)
         else:
-            cfg = self.get_plugin_config(db_type, default={})
             try:
                 heartbeat_n = int(cfg.get("HEARTBEAT_EVERY_N_RUNS") or 0)
             except (TypeError, ValueError):
