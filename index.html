@@ -179,6 +179,90 @@
       </div>
     </section>
 
+    <!-- Drive Activity API 활성화 방법 -->
+    <section class="gp-card gp-card-wide">
+      <h3 class="gp-card-title">🔑 Drive Activity API 활성화 방법 (Activity 기반 감시를 쓰려면 필수)</h3>
+      <p class="gp-hint">
+        이 플러그인은 변경 감지에 Drive Activity API(driveactivity.readonly)를 사용합니다.
+        rclone 기본 client_id는 drive/drive.readonly 등 정해진 스코프만 등록돼 있어서
+        activity.readonly는 요청할 수 없습니다 - 아래 순서대로 <b>나만의 OAuth 클라이언트</b>를
+        만들어야 합니다. 이미 해두셨다면 이 섹션은 건너뛰어도 됩니다.
+      </p>
+
+      <ol class="gp-steps">
+        <li>
+          <div class="gp-step-title">Drive Activity API 활성화</div>
+          <div class="gp-step-desc">
+            <a href="https://console.cloud.google.com/" target="_blank" rel="noopener">Google Cloud Console</a>
+            → 해당 프로젝트 선택 → <b>API 및 서비스 &gt; 라이브러리</b>에서
+            <code>Google Drive Activity API</code>를 검색해 활성화(Enable)합니다.
+            Drive API 자체는 이미 켜져 있겠지만 Activity API는 별개라 따로 켜야 합니다.
+          </div>
+        </li>
+        <li>
+          <div class="gp-step-title">나만의 OAuth 클라이언트 ID 만들기</div>
+          <div class="gp-step-desc">
+            <b>API 및 서비스 &gt; 사용자 인증 정보 &gt; 사용자 인증 정보 만들기 &gt; OAuth 클라이언트 ID</b>에서
+            애플리케이션 유형 <b>데스크톱 앱</b>으로 하나 생성하고, <code>client_id</code>/<code>client_secret</code>을
+            메모해둡니다.
+          </div>
+        </li>
+        <li>
+          <div class="gp-step-title">OAuth 동의 화면에 스코프 추가</div>
+          <div class="gp-step-desc">
+            <b>API 및 서비스 &gt; OAuth 동의 화면</b>(또는 좌측 <b>데이터 액세스</b>) 메뉴에서
+            "범위 추가 또는 삭제"를 누르고 아래 두 스코프를 목록에서 찾아 추가합니다
+            (목록에 안 보이면 하단 "수동으로 범위 추가" 텍스트박스에 URL을 직접 입력).
+            업데이트 후 저장합니다.
+            <ul class="gp-scope-list">
+              <li><code>https://www.googleapis.com/auth/drive</code></li>
+              <li><code>https://www.googleapis.com/auth/drive.activity.readonly</code></li>
+            </ul>
+          </div>
+        </li>
+        <li>
+          <div class="gp-step-title">테스트 사용자 등록 (미게시 상태인 경우)</div>
+          <div class="gp-step-desc">
+            앱이 "테스트" 상태면 <b>대상(Audience)</b> 메뉴에서 본인 구글 계정을 테스트 사용자로
+            추가해야 로그인할 수 있습니다. 개인용이면 그냥 게시(Publish)해도 무방합니다
+            (100명 미만 개인 사용은 검증 없이도 계속 사용 가능하고, 테스트 상태로 두면 refresh_token이
+            7일마다 만료되어 번거롭습니다).
+          </div>
+        </li>
+        <li>
+          <div class="gp-step-title">rclone remote에 새 client_id/secret/scope 반영</div>
+          <div class="gp-step-desc">
+            <code>rclone config</code> 실행 → 해당 remote 선택 → <b>e) Edit this remote</b>로 들어가서
+            client_id/client_secret을 2단계에서 만든 값으로 바꾸고, scope 항목에는 쉼표로 구분해
+            <code>drive,https://www.googleapis.com/auth/drive.activity.readonly</code>를 직접 입력합니다
+            (메뉴 번호가 아니라 직접 타이핑 - rclone이 자유 입력을 허용합니다).
+          </div>
+        </li>
+        <li>
+          <div class="gp-step-title">재인증으로 새 토큰 발급</div>
+          <div class="gp-step-desc">
+            설정 마지막 "Already have a token - replace it?" 질문에서 재인증을 진행합니다.
+            브라우저 동의 화면에 3단계에서 추가한 두 스코프가 실제로 나열되는지 확인하고 승인하세요.
+            여기서 발급된 새 refresh_token에 비로소 activity.readonly 권한이 포함됩니다
+            (기존 토큰을 그대로 두면 스코프가 안 바뀝니다 - 반드시 재인증해야 함).
+          </div>
+        </li>
+        <li>
+          <div class="gp-step-title">반영 확인</div>
+          <div class="gp-step-desc">
+            <code>rclone rc config/dump</code>(위 rclone RC 주소로 확인)로 해당 remote의 토큰이
+            갱신됐는지 확인한 뒤, 이 플러그인을 재시작하거나 위 "즉시 실행" 버튼으로 한 번 돌려서
+            로그에 403(insufficient scopes) 없이 정상 조회(mode=ok)가 되는지 확인합니다.
+          </div>
+        </li>
+      </ol>
+
+      <p class="gp-field-note">
+        union remote(예: gds2를 여러 remote로 묶은 경우)를 쓰고 있다면, 재인증은 union이 아니라
+        WATCH_TARGET에 지정한 실제 하위 REMOTE_NAME을 대상으로 해야 합니다.
+      </p>
+    </section>
+
   </div>
 
   <div class="gp-save-bar">

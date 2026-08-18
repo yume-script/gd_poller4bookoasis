@@ -263,3 +263,67 @@
   font-size: 13px;
   min-height: 16px;
 }
+
+.gp-steps {
+  margin: 0;
+  padding-left: 0;
+  list-style: none;
+  counter-reset: gp-step;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.gp-steps > li {
+  counter-increment: gp-step;
+  display: flex;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(148, 163, 184, 0.15);
+}
+.gp-steps > li::before {
+  content: counter(gp-step);
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: rgba(139, 92, 246, 0.25);
+  color: #c4b5fd;
+  font-weight: 700;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 1px;
+}
+.gp-step-title {
+  font-weight: 700;
+  font-size: 13.5px;
+  margin-bottom: 3px;
+}
+.gp-steps .gp-step-desc {
+  font-size: 13px;
+  line-height: 1.6;
+  opacity: 0.85;
+}
+.gp-steps .gp-step-desc b {
+  opacity: 1;
+}
+.gp-steps code {
+  background: rgba(148, 163, 184, 0.15);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 12px;
+  word-break: break-all;
+}
+.gp-steps a {
+  color: #93c5fd;
+}
+.gp-scope-list {
+  margin: 6px 0 0 0;
+  padding-left: 18px;
+}
+.gp-scope-list li {
+  margin-bottom: 2px;
+}
