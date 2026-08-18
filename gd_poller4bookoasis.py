@@ -221,6 +221,10 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
 
     _watchdog_threads = {}
     _scheduler_lock = threading.Lock()
+    # RUN_NOW_TOKEN으로 트리거되는 수동 실행을 5초 watch job과 분리해서
+    # 돌리기 위한 스레드/락 (자세한 이유는 _check_tokens 참고)
+    _manual_run_threads = {}
+    _manual_run_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # 필수 인터페이스 (검색 미지원 플러그인)
@@ -518,10 +522,21 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         dirty = False
 
         if run_token and run_token != tstate.get("last_run_now_token"):
-            self.check_all_targets(db_type)
-            tstate["last_run_now_token"] = run_token
-            tstate["last_run_now_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            dirty = True
+            # check_all_targets()를 여기서 바로(동기) 돌리면, 그 안의
+            # 구글 API 호출이 오래 걸리거나(네트워크 지연) 멈출 때
+            # (방화벽 차단 등) 이 5초 주기 watch job 자체가 막혀버린다.
+            # watch job은 max_instances=1이라, 한 번 막히면 이후 모든
+            # 틱이 "maximum number of running instances reached"로
+            # 영구히 스킵되는 사고로 이어진다(실사용 중 발견됨). 그래서
+            # 실제 작업은 별도 스레드로 던지고 watch job 자체는 항상
+            # 즉시 반환하게 한다. 이미 돌고 있는 수동 실행이 있으면
+            # 새로 또 띄우지 않고 조용히 스킵한다.
+            if self._start_manual_run(db_type):
+                tstate["last_run_now_token"] = run_token
+                tstate["last_run_now_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                dirty = True
+            else:
+                self._log_line("[전체] 즉시 실행 요청 스킵: 이전 수동 실행이 아직 진행 중")
 
         if log_clear_token and log_clear_token != tstate.get("last_log_clear_token"):
             try:
@@ -534,6 +549,32 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
 
         if dirty:
             self._write_tokens_state(tstate)
+
+    def _start_manual_run(self, db_type):
+        """
+        RUN_NOW_TOKEN 감지로 트리거된 check_all_targets()를 별도 스레드에서
+        실행한다. 이미 같은 db_type에 대해 실행 중인 스레드가 있으면(직전
+        수동 실행이 아직 안 끝났으면) 새로 띄우지 않고 False를 돌려준다.
+        """
+        with GdPoller4BookOasisProvider._manual_run_lock:
+            existing = GdPoller4BookOasisProvider._manual_run_threads.get(db_type)
+            if existing and existing.is_alive():
+                return False
+            t = threading.Thread(
+                target=self._manual_run_worker,
+                args=(db_type,),
+                daemon=True,
+                name=f"gd_poller4bookoasis_manual_run_{db_type}",
+            )
+            GdPoller4BookOasisProvider._manual_run_threads[db_type] = t
+            t.start()
+            return True
+
+    def _manual_run_worker(self, db_type):
+        try:
+            self.check_all_targets(db_type)
+        except Exception as e:
+            self._log_line(f"[전체] 즉시 실행 중 오류: {e}")
 
     # ------------------------------------------------------------------
     # rclone RC API(config/dump)로 OAuth 토큰 읽기
@@ -602,6 +643,38 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
                 "https://www.googleapis.com/auth/drive.activity.readonly",
             ],
         )
+
+    def _build_google_clients(self, creds, timeout=30):
+        """
+        Drive/Activity API 클라이언트를 명시적 소켓 타임아웃과 함께 생성한다.
+
+        build(..., credentials=creds)만 쓰면 내부 HTTP 전송 계층에
+        타임아웃이 전혀 걸리지 않는다. 이 상태에서 네트워크가 멈추면
+        (방화벽 차단, DNS 지연, 순간적인 구글 API 응답 지연 등)
+        execute() 호출이 영원히 반환하지 않을 수 있다. 이게 실제로
+        RUN_NOW_TOKEN 감지용 5초 주기 watch job 안에서 터지면, 그 job은
+        max_instances=1이라 이후 모든 틱이 영구히 "maximum number of
+        running instances reached"로 스킵되는 사고로 이어진다(실사용
+        중 발견됨). httplib2.Http(timeout=...)로 감싼 AuthorizedHttp를
+        명시적으로 넘겨서 이 문제를 막는다.
+
+        AuthorizedHttp/Http 인스턴스는 스레드 안전하지 않으므로 build()
+        호출마다 새로 만들어서 쓴다 (여러 build를 위해 하나를 재사용하지
+        않음).
+        """
+        from httplib2 import Http
+        from google_auth_httplib2 import AuthorizedHttp
+        from googleapiclient.discovery import build
+
+        drive = build(
+            "drive", "v3",
+            http=AuthorizedHttp(creds, http=Http(timeout=timeout)),
+        )
+        activity = build(
+            "driveactivity", "v2",
+            http=AuthorizedHttp(creds, http=Http(timeout=timeout)),
+        )
+        return drive, activity
 
     # ------------------------------------------------------------------
     # Drive Activity API v2 헬퍼 (halfaider/gd-poller의
@@ -915,7 +988,6 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
     # ------------------------------------------------------------------
     def check_target(self, db_type, target):
         import datetime
-        from googleapiclient.discovery import build
 
         if target.get("parse_error"):
             return {"mode": "error", "error": target["parse_error"], "changes_found": 0}
@@ -926,8 +998,7 @@ class GdPoller4BookOasisProvider(BaseMetadataProvider):
         display_label = self._display_label(target)
 
         creds = self._load_credentials(db_type, remote_name)
-        drive = build("drive", "v3", credentials=creds)
-        activity = build("driveactivity", "v2", credentials=creds)
+        drive, activity = self._build_google_clients(creds)
 
         cfg = self.get_plugin_config(db_type, default={})
         try:
