@@ -18,6 +18,7 @@
   var clearLogResultEl = document.getElementById("gp-clear-log-result");
   var saveBtn = document.getElementById("gp-save-btn");
   var saveResultEl = document.getElementById("gp-save-result");
+  var statsRowEl = document.getElementById("gp-stats-row");
 
   var formPopulated = false;
 
@@ -75,6 +76,47 @@
     statusEl.innerHTML = html;
   }
 
+  function statItem(value, label, warn) {
+    return (
+      '<div class="gp-stat">' +
+      '<div class="gp-stat-value' +
+      (warn ? " gp-stat-warn" : "") +
+      '">' +
+      value +
+      "</div>" +
+      '<div class="gp-stat-label">' +
+      label +
+      "</div>" +
+      "</div>"
+    );
+  }
+
+  // 상단 제목칸의 요약 통계 줄 (등록 대상/정상/오류/스케줄러/폴링주기/누적실행)
+  function renderStats(data) {
+    var targets = data.targets || [];
+    var total = targets.length;
+    var errorCount = targets.filter(function (t) {
+      return !!t.parse_error;
+    }).length;
+    var validCount = total - errorCount;
+    var runCountSum = targets.reduce(function (sum, t) {
+      return sum + (Number(t.run_count) || 0);
+    }, 0);
+    var pollInterval =
+      (data.config && data.config.POLL_INTERVAL_SECONDS) || "-";
+    var schedulerOk = data.scheduler_backend === "apscheduler";
+
+    var html = "";
+    html += statItem(total, "등록된 감시 대상");
+    html += statItem(validCount, "정상 설정");
+    html += statItem(errorCount, "설정 오류", errorCount > 0);
+    html += statItem(schedulerOk ? "정상" : "폴백", "스케줄러", !schedulerOk);
+    html += statItem(pollInterval + "초", "폴링 주기");
+    html += statItem(runCountSum, "누적 실행(합계)");
+
+    statsRowEl.innerHTML = html;
+  }
+
   // 저장된 설정값(config)을 폼 입력창에 채운다. 사용자가 입력 중인 값을
   // 덮어쓰지 않도록, 페이지 진입 후 최초 1회(및 저장 직후 재조회)에만 채운다.
   function populateForm(config) {
@@ -103,6 +145,7 @@
       .then(function (data) {
         if (data && data.success) {
           renderStatus(data);
+          renderStats(data);
           if (!formPopulated) {
             populateForm(data.config);
           }
@@ -217,6 +260,7 @@
             resultEl.textContent = doneMessage;
             resultEl.className = "gp-run-result gp-result-ok";
             renderStatus(data);
+            renderStats(data);
             return;
           }
           if (n >= MAX_ATTEMPTS) {

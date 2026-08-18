@@ -1,19 +1,24 @@
 <div class="gp-root">
-  <div class="gp-toolbar">
-    <div class="gp-toolbar-left">
-      <i class="fa-solid fa-cloud-arrow-down"></i>
-      <span class="gp-title">구글드라이브 감시 (gd_poller4bookoasis)</span>
-    </div>
-    <div class="gp-toolbar-right">
-      <button id="gp-refresh-btn" type="button" class="gp-btn gp-btn-ghost">
-        <i class="fa-solid fa-rotate"></i> 새로고침
+  <div class="gp-header">
+    <div class="gp-header-top">
+      <div class="gp-header-title">
+        <span class="gp-header-icon"><i class="fa-solid fa-cloud-arrow-down"></i></span>
+        <div>
+          <div class="gp-header-titletext">구글드라이브 감시</div>
+          <div class="gp-header-desc">
+            구글 드라이브 폴더(하위 포함) 변경을 감시하다가 변경이 감지되면 rclone VFS 캐시를
+            refresh하고, 설정 시 디스코드로 알립니다.
+          </div>
+        </div>
+      </div>
+      <button id="gp-refresh-btn" type="button" class="gp-btn gp-btn-ghost gp-header-refresh">
+        <i class="fa-solid fa-rotate"></i> 목록 새로고침
       </button>
     </div>
+    <div id="gp-stats-row" class="gp-stats-row">
+      <div class="gp-stat-loading">불러오는 중...</div>
+    </div>
   </div>
-  <p class="gp-page-desc">
-    구글 드라이브 폴더(하위 포함) 변경을 감시하다가 변경이 감지되면 rclone VFS 캐시를
-    refresh하고, 설정 시 디스코드로 알립니다.
-  </p>
 
   <div class="gp-grid">
 
