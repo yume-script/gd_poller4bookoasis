@@ -191,13 +191,12 @@
 }
 
 .gp-save-bar {
-  position: sticky;
-  bottom: 0;
   display: flex;
   align-items: center;
   gap: 14px;
   margin-top: 18px;
-  padding: 12px 4px 4px 4px;
+  padding: 14px 4px 4px 4px;
+  border-top: 1px solid rgba(148, 163, 184, 0.25);
 }
 .gp-save-result {
   font-size: 13px;
